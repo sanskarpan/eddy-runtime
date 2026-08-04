@@ -1,0 +1,29 @@
+[package]
+name = "eddy"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+
+[dependencies]
+libc = "0.2"
+slab = "0.4"
+parking_lot = "0.12"
+pin-project-lite = "0.2"
+tracing = "0.1"
+crossbeam-utils = "0.8"
+
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
+[dev-dependencies]
+criterion = "0.5"
+proptest = "1"
+futures = "0.3"
+tokio = { version = "1", features = ["full"] }
+
+[[example]]
+name = "spike"
+path = "examples/spike.rs"
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ["cfg(loom)"] }
