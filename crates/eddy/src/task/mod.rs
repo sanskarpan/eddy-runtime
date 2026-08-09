@@ -10,7 +10,7 @@ mod raw;
 mod state;
 mod waker;
 
-pub(crate) use raw::RawTask;
+pub(crate) use raw::{Header, RawTask};
 
 pub use join::{AbortHandle, JoinError, JoinHandle};
 
@@ -134,6 +134,52 @@ where
     let raw = RawTask::new(future, scheduler);
     let handle = JoinHandle::new(raw);
     (Notified::new(raw), handle)
+}
+
+/// Spawn a blocking closure on the current runtime's blocking pool.
+///
+/// The closure runs on a dedicated thread so it can do synchronous work
+/// without stalling the runtime's workers. Once started, the task is **not
+/// cancellable** — it always runs to completion; dropping or aborting the
+/// returned handle does not interrupt it. Tasks still queued when the
+/// runtime shuts down are cancelled (`JoinError::Cancelled`).
+///
+/// # Panics
+/// Panics if called outside of a runtime.
+pub fn spawn_blocking<F, R>(task: F) -> JoinHandle<R>
+where
+    F: FnOnce() -> R + Send + Unpin + 'static,
+    R: Send + 'static,
+{
+    crate::runtime::Handle::try_current()
+        .expect(
+            "no eddy runtime running on this thread: spawn_blocking must be called \
+             from inside a runtime, or use Runtime::spawn_blocking",
+        )
+        .spawn_blocking(task)
+}
+
+/// Run `fut` on the current thread, handing this worker's run queue to a
+/// takeover thread for the duration so the future may borrow non-`'static`
+/// data and perform blocking work.
+///
+/// Only meaningful on multi-thread runtimes: on a current-thread runtime
+/// there is no queue to hand off, so this panics with a clear message
+/// rather than deadlocking. On a thread that is not a worker (for example
+/// the `block_on` thread) the future is simply run in place.
+///
+/// # Panics
+/// Panics if called outside of a runtime, or inside a current-thread
+/// runtime.
+pub fn block_in_place<F, R>(fut: F) -> R
+where
+    F: Future<Output = R>,
+{
+    let handle = crate::runtime::Handle::try_current().expect(
+        "no eddy runtime running on this thread: block_in_place must be called \
+             from inside a runtime",
+    );
+    handle.block_in_place(fut)
 }
 
 #[cfg(all(test, not(loom)))]
