@@ -1,0 +1,328 @@
+use std::marker::{PhantomData, PhantomPinned};
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
+
+use crate::util::{Linked, LinkedList, Pointers};
+
+struct Waiter {
+    links: Pointers<Waiter>,
+    permits: usize,
+    waker: Option<Waker>,
+    granted: bool,
+}
+
+impl Waiter {
+    fn new(permits: usize) -> Waiter {
+        Waiter {
+            links: Pointers::new(),
+            permits,
+            waker: None,
+            granted: false,
+        }
+    }
+}
+
+impl Linked for Waiter {
+    fn pointers(&self) -> &Pointers<Self> {
+        &self.links
+    }
+
+    fn pointers_mut(&mut self) -> &mut Pointers<Self> {
+        &mut self.links
+    }
+}
+
+// SAFETY: Waiter is accessed only while the semaphore state mutex is held.
+unsafe impl Send for Waiter {}
+// SAFETY: Waiter is accessed only while the semaphore state mutex is held.
+unsafe impl Sync for Waiter {}
+
+struct State {
+    permits: usize,
+    closed: bool,
+    waiters: LinkedList<Waiter>,
+}
+
+// SAFETY: the waiter list is only accessed while the semaphore state mutex is
+// held; each raw node points into a pinned future that remains alive there.
+unsafe impl Send for State {}
+// SAFETY: the waiter list is only accessed while the semaphore state mutex is held.
+unsafe impl Sync for State {}
+
+struct Inner {
+    state: Mutex<State>,
+}
+
+pub struct Semaphore {
+    inner: Arc<Inner>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AcquireError;
+
+impl std::fmt::Display for AcquireError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("semaphore is closed")
+    }
+}
+
+impl std::error::Error for AcquireError {}
+
+pub struct Acquire<'a> {
+    inner: Arc<Inner>,
+    waiter: Waiter,
+    _marker: PhantomData<&'a Semaphore>,
+    _pin: PhantomPinned,
+}
+
+impl<'a> Acquire<'a> {
+    fn new(inner: Arc<Inner>, permits: usize) -> Acquire<'a> {
+        Acquire {
+            inner,
+            waiter: Waiter::new(permits),
+            _marker: PhantomData,
+            _pin: PhantomPinned,
+        }
+    }
+}
+
+impl Future for Acquire<'_> {
+    type Output = Result<SemaphorePermit, AcquireError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // SAFETY: polling does not move the pinned future allocation.
+        let this = unsafe { self.get_unchecked_mut() };
+        let mut state = this.inner.state.lock().unwrap();
+        if this.waiter.granted {
+            this.waiter.granted = false;
+            let inner = this.inner.clone();
+            return Poll::Ready(Ok(SemaphorePermit {
+                inner,
+                permits: this.waiter.permits,
+            }));
+        }
+        if state.closed {
+            if this.waiter.links.is_linked() {
+                let ptr = std::ptr::NonNull::from(&mut this.waiter);
+                // SAFETY: the waiter is linked in this semaphore's list.
+                unsafe { state.waiters.remove(ptr) };
+            }
+            return Poll::Ready(Err(AcquireError));
+        }
+        if !this.waiter.links.is_linked()
+            && state.waiters.is_empty()
+            && state.permits >= this.waiter.permits
+        {
+            state.permits -= this.waiter.permits;
+            return Poll::Ready(Ok(SemaphorePermit {
+                inner: this.inner.clone(),
+                permits: this.waiter.permits,
+            }));
+        }
+        this.waiter.waker = Some(cx.waker().clone());
+        if !this.waiter.links.is_linked() {
+            let ptr = std::ptr::NonNull::from(&mut this.waiter);
+            // SAFETY: the future is pinned for the duration of registration;
+            // Drop removes the node before the future is moved or destroyed.
+            unsafe { state.waiters.push_back(ptr) };
+        }
+        Poll::Pending
+    }
+}
+
+impl Drop for Acquire<'_> {
+    fn drop(&mut self) {
+        let mut state = self.inner.state.lock().unwrap();
+        if self.waiter.links.is_linked() {
+            let ptr = std::ptr::NonNull::from(&mut self.waiter);
+            // SAFETY: the waiter is linked in this semaphore's list.
+            unsafe { state.waiters.remove(ptr) };
+        } else if self.waiter.granted {
+            self.waiter.granted = false;
+            let wakes = release_locked(&mut state, self.waiter.permits);
+            drop(state);
+            wake_all(wakes);
+        }
+    }
+}
+
+pub struct SemaphorePermit {
+    inner: Arc<Inner>,
+    permits: usize,
+}
+
+impl SemaphorePermit {
+    pub fn forget(self) {
+        std::mem::forget(self);
+    }
+
+    pub fn permits(&self) -> usize {
+        self.permits
+    }
+}
+
+impl Drop for SemaphorePermit {
+    fn drop(&mut self) {
+        let mut state = self.inner.state.lock().unwrap();
+        let wakes = release_locked(&mut state, self.permits);
+        drop(state);
+        wake_all(wakes);
+    }
+}
+
+pub type OwnedSemaphorePermit = SemaphorePermit;
+
+fn release_locked(state: &mut State, permits: usize) -> Vec<Waker> {
+    state.permits = state.permits.saturating_add(permits);
+    let mut wakes = Vec::new();
+    while let Some(ptr) = {
+        // SAFETY: the semaphore state mutex is held by the caller.
+        unsafe { state.waiters.pop_front() }
+    } {
+        // SAFETY: ptr was owned by the waiter list and remains live because
+        // the waiting future owns the allocation containing it.
+        let waiter = unsafe { &mut *ptr.as_ptr() };
+        if waiter.permits > state.permits {
+            // SAFETY: restore the FIFO head when it cannot yet be granted.
+            unsafe { state.waiters.push_front(ptr) };
+            break;
+        }
+        state.permits -= waiter.permits;
+        waiter.granted = true;
+        if let Some(waker) = waiter.waker.take() {
+            wakes.push(waker);
+        }
+    }
+    wakes
+}
+
+fn wake_all(wakes: Vec<Waker>) {
+    for waker in wakes {
+        waker.wake();
+    }
+}
+
+impl Semaphore {
+    pub fn new(permits: usize) -> Semaphore {
+        Semaphore {
+            inner: Arc::new(Inner {
+                state: Mutex::new(State {
+                    permits,
+                    closed: false,
+                    waiters: LinkedList::new(),
+                }),
+            }),
+        }
+    }
+
+    pub fn available_permits(&self) -> usize {
+        self.inner.state.lock().unwrap().permits
+    }
+
+    pub fn acquire(&self) -> Acquire<'_> {
+        self.acquire_many(1)
+    }
+
+    pub fn acquire_many(&self, permits: usize) -> Acquire<'_> {
+        assert!(
+            permits > 0,
+            "eddy: semaphore acquire count must be non-zero"
+        );
+        Acquire::new(self.inner.clone(), permits)
+    }
+
+    pub fn acquire_owned(self: Arc<Self>) -> Acquire<'static> {
+        self.acquire_many_owned(1)
+    }
+
+    pub fn acquire_many_owned(self: Arc<Self>, permits: usize) -> Acquire<'static> {
+        assert!(
+            permits > 0,
+            "eddy: semaphore acquire count must be non-zero"
+        );
+        Acquire::new(self.inner.clone(), permits)
+    }
+
+    pub fn try_acquire(&self) -> Result<SemaphorePermit, AcquireError> {
+        self.try_acquire_many(1)
+    }
+
+    pub fn try_acquire_many(&self, permits: usize) -> Result<SemaphorePermit, AcquireError> {
+        assert!(
+            permits > 0,
+            "eddy: semaphore acquire count must be non-zero"
+        );
+        let mut state = self.inner.state.lock().unwrap();
+        if state.closed || !state.waiters.is_empty() || state.permits < permits {
+            return Err(AcquireError);
+        }
+        state.permits -= permits;
+        Ok(SemaphorePermit {
+            inner: self.inner.clone(),
+            permits,
+        })
+    }
+
+    pub fn add_permits(&self, permits: usize) {
+        if permits == 0 {
+            return;
+        }
+        let mut state = self.inner.state.lock().unwrap();
+        let wakes = release_locked(&mut state, permits);
+        drop(state);
+        wake_all(wakes);
+    }
+
+    pub fn close(&self) {
+        let mut state = self.inner.state.lock().unwrap();
+        state.closed = true;
+        let mut wakes = Vec::new();
+        // SAFETY: every node belongs to this list and remains live in its
+        // pinned Acquire future.
+        while let Some(ptr) = unsafe { state.waiters.pop_front() } {
+            // SAFETY: ptr came from the list and points to a live waiter.
+            if let Some(waker) = unsafe { &mut *ptr.as_ptr() }.waker.take() {
+                wakes.push(waker);
+            }
+        }
+        drop(state);
+        for waker in wakes {
+            waker.wake();
+        }
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.inner.state.lock().unwrap().closed
+    }
+}
+
+use std::future::Future;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn permits_are_fifo_and_returned_on_drop() {
+        let semaphore = Semaphore::new(1);
+        let first = semaphore.try_acquire().unwrap();
+        assert!(semaphore.try_acquire().is_err());
+        drop(first);
+        assert_eq!(semaphore.available_permits(), 1);
+    }
+
+    #[test]
+    fn close_wakes_waiters_with_an_error() {
+        let semaphore = Arc::new(Semaphore::new(0));
+        let mut acquire = Box::pin(semaphore.acquire());
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(matches!(acquire.as_mut().poll(&mut cx), Poll::Pending));
+        semaphore.close();
+        assert!(matches!(
+            acquire.as_mut().poll(&mut cx),
+            Poll::Ready(Err(_))
+        ));
+    }
+}
