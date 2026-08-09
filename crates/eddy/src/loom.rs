@@ -3,7 +3,7 @@
 //! and gets exhaustive interleaving checking for free under
 //! `RUSTFLAGS="--cfg loom" cargo test`. Extend with `Arc`/`thread`/etc. as
 //! later phases (Chase-Lev deque, injector) need loom-aware versions of
-//! them — only `atomic` is used so far.
+//! them — the queue uses the shim for atomics, `Arc`, and threads.
 
 #[cfg(not(loom))]
 pub(crate) mod sync {
@@ -24,11 +24,11 @@ pub(crate) mod sync {
 #[cfg(not(loom))]
 pub(crate) mod thread {
     #[allow(unused_imports)]
-    pub(crate) use std::thread::{current, park, yield_now, Thread, ThreadId};
+    pub(crate) use std::thread::{current, park, spawn, yield_now, Thread, ThreadId};
 }
 
 #[cfg(loom)]
 pub(crate) mod thread {
     #[allow(unused_imports)]
-    pub(crate) use loom::thread::{current, park, yield_now, Thread, ThreadId};
+    pub(crate) use loom::thread::{current, park, spawn, yield_now, Thread, ThreadId};
 }
