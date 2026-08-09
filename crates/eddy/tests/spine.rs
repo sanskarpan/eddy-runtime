@@ -366,7 +366,7 @@ fn detached_non_send_output_is_dropped_before_foreign_waker_cleanup() {
     let drops_for_root = drops.clone();
 
     rt.block_on(async move {
-        let handle = eddy::Handle::current().spawn(ReadyCapture {
+        let handle = eddy::Handle::current().spawn_local(ReadyCapture {
             task_slot: task_slot_for_task,
             root_slot: root_slot_for_task,
             output: Some(OwnerOutput {
