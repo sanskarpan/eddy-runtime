@@ -9,8 +9,11 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use std::thread::{Thread, ThreadId};
+use std::time::Duration;
 
+use crate::blocking::{self, BlockingPool};
 use crate::task::{self, JoinHandle, Notified, RawTask, Schedule};
+use crate::time::TimerShared;
 
 const GLOBAL_QUEUE_INTERVAL: u32 = 61;
 
@@ -25,6 +28,8 @@ struct Inner {
     tasks: Mutex<Vec<RawTask>>,
     closed: AtomicBool,
     shutdown_complete: AtomicBool,
+    timer: Arc<TimerShared>,
+    blocking: BlockingPool,
 }
 
 // SAFETY: every shared queue and lifecycle field is protected by its Mutex or
@@ -39,7 +44,9 @@ unsafe impl Sync for Inner {}
 pub(crate) struct CurrentThread(Arc<Inner>);
 
 impl CurrentThread {
-    pub(crate) fn new() -> CurrentThread {
+    pub(crate) fn new(max_blocking_threads: usize, keep_alive: Duration) -> CurrentThread {
+        let owner_thread = std::thread::current();
+        let timer = TimerShared::new(Arc::new(move || owner_thread.unpark()));
         CurrentThread(Arc::new(Inner {
             local: Mutex::new(VecDeque::new()),
             injection: Mutex::new(VecDeque::new()),
@@ -51,6 +58,8 @@ impl CurrentThread {
             tasks: Mutex::new(Vec::new()),
             closed: AtomicBool::new(false),
             shutdown_complete: AtomicBool::new(false),
+            timer,
+            blocking: BlockingPool::new(max_blocking_threads, keep_alive),
         }))
     }
 
@@ -125,6 +134,19 @@ impl CurrentThread {
         handle
     }
 
+    pub(crate) fn spawn_blocking<F, R>(&self, task: F) -> JoinHandle<R>
+    where
+        F: FnOnce() -> R + Send + Unpin + 'static,
+        R: Send + 'static,
+    {
+        assert!(
+            !self.0.closed.load(Ordering::Acquire),
+            "eddy: cannot spawn on a shut down runtime"
+        );
+        let handle = crate::runtime::Handle::from_current(self.clone());
+        blocking::spawn_on_pool(&self.0.blocking, handle, task)
+    }
+
     pub(crate) fn block_on<F: Future>(&self, future: F) -> F::Output {
         {
             let mut owner = self.0.owner.lock().unwrap();
@@ -138,7 +160,8 @@ impl CurrentThread {
         let _cleanup = BlockOnCleanup {
             scheduler: self.clone(),
         };
-        let _enter = crate::runtime::EnterGuard::new(self.clone());
+        let _enter =
+            crate::runtime::EnterGuard::new(crate::runtime::Handle::from_current(self.clone()));
 
         let signal = Arc::new(RootSignal {
             thread: std::thread::current(),
@@ -158,9 +181,19 @@ impl CurrentThread {
 
             match self.next_task() {
                 Some(task) => task.run(),
-                None => std::thread::park(),
+                None => {
+                    self.0.timer.advance_to_now();
+                    match self.0.timer.next_timeout() {
+                        Some(timeout) => std::thread::park_timeout(timeout),
+                        None => std::thread::park(),
+                    }
+                }
             }
         }
+    }
+
+    pub(crate) fn timer_driver(&self) -> Arc<TimerShared> {
+        self.0.timer.clone()
     }
 
     fn drain_deferred(&self) {
@@ -206,6 +239,7 @@ impl CurrentThread {
         for task in registered {
             task.drop_reference_on_owner();
         }
+        self.0.blocking.shutdown();
     }
 }
 
@@ -325,13 +359,19 @@ mod tests {
 
     #[test]
     fn block_on_ready_future_returns_immediately() {
-        let rt = CurrentThread::new();
+        let rt = CurrentThread::new(
+            crate::blocking::DEFAULT_MAX_BLOCKING_THREADS,
+            crate::blocking::DEFAULT_KEEP_ALIVE,
+        );
         assert_eq!(rt.block_on(async { 42 }), 42);
     }
 
     #[test]
     fn spawn_1000_tasks_all_complete() {
-        let rt = CurrentThread::new();
+        let rt = CurrentThread::new(
+            crate::blocking::DEFAULT_MAX_BLOCKING_THREADS,
+            crate::blocking::DEFAULT_KEEP_ALIVE,
+        );
         rt.block_on(async {
             let mut handles = Vec::new();
             for i in 0..1000 {
@@ -347,7 +387,10 @@ mod tests {
 
     #[test]
     fn nested_spawn_works() {
-        let rt = CurrentThread::new();
+        let rt = CurrentThread::new(
+            crate::blocking::DEFAULT_MAX_BLOCKING_THREADS,
+            crate::blocking::DEFAULT_KEEP_ALIVE,
+        );
         let out = rt.block_on(async {
             let handle = crate::runtime::Handle::current().spawn(async {
                 let inner = crate::runtime::Handle::current().spawn(async { 9 });
@@ -360,11 +403,14 @@ mod tests {
 
     #[test]
     fn non_send_spawned_future_compiles_and_runs() {
-        let rt = CurrentThread::new();
+        let rt = CurrentThread::new(
+            crate::blocking::DEFAULT_MAX_BLOCKING_THREADS,
+            crate::blocking::DEFAULT_KEEP_ALIVE,
+        );
         let value = std::rc::Rc::new(5);
         let out = rt.block_on(async move {
             crate::runtime::Handle::current()
-                .spawn(async move { *value + 1 })
+                .spawn_local(async move { *value + 1 })
                 .await
                 .unwrap()
         });
@@ -373,7 +419,10 @@ mod tests {
 
     #[test]
     fn wake_from_another_thread_makes_progress() {
-        let rt = CurrentThread::new();
+        let rt = CurrentThread::new(
+            crate::blocking::DEFAULT_MAX_BLOCKING_THREADS,
+            crate::blocking::DEFAULT_KEEP_ALIVE,
+        );
         rt.block_on(async {
             let (tx, rx) = std::sync::mpsc::channel::<()>();
             let waker_slot = Arc::new(parking_lot::Mutex::new(None::<Waker>));
@@ -415,7 +464,10 @@ mod tests {
 
     #[test]
     fn root_pending_future_is_not_repolled_without_a_wake() {
-        let rt = CurrentThread::new();
+        let rt = CurrentThread::new(
+            crate::blocking::DEFAULT_MAX_BLOCKING_THREADS,
+            crate::blocking::DEFAULT_KEEP_ALIVE,
+        );
         let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let task_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let waker_slot = Arc::new(parking_lot::Mutex::new(None::<Waker>));
