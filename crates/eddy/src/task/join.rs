@@ -36,10 +36,13 @@ impl From<JoinErrorRepr> for JoinError {
 
 pub struct JoinHandle<T> {
     raw: Option<RawTask>,
-    // Current-thread tasks may contain `!Send` futures. Their join and abort
-    // handles therefore stay on the owner thread until a multi-thread task
-    // representation is introduced in a later phase.
-    _marker: PhantomData<(T, std::rc::Rc<()>)>,
+    // The handle holds only a type-erased task pointer; `T` is tracked for
+    // variance and auto-trait purposes. `PhantomData<T>` makes the handle
+    // `Send`/`Sync` exactly when `T` is, which is sound: awaiting the handle
+    // moves `T` out of the task core onto the awaiting thread, so a `!Send`
+    // output (current-thread tasks) must keep the handle pinned to its
+    // owning thread.
+    _marker: PhantomData<T>,
 }
 
 // `JoinHandle<T>` never stores a `T` inline (only a pointer to the task
@@ -47,6 +50,14 @@ pub struct JoinHandle<T> {
 // needs to be pinned — explicit rather than relying on `PhantomData<T>`'s
 // own Unpin-ness, which does track `T`.
 impl<T> Unpin for JoinHandle<T> {}
+
+// SAFETY: the header, state, and output all live in the shared task
+// allocation, and every operation (`abort`, `try_read_output`, refcounts)
+// is safe from any thread once `T: Send` allows the output to cross
+// threads.
+unsafe impl<T: Send> Send for JoinHandle<T> {}
+// SAFETY: see `Send`; sharing the handle only shares the task pointer.
+unsafe impl<T: Sync> Sync for JoinHandle<T> {}
 
 impl<T> JoinHandle<T> {
     /// Takes ownership of the "JoinHandle" reference baked into the task's
@@ -74,10 +85,7 @@ impl<T> JoinHandle<T> {
     pub fn abort_handle(&self) -> AbortHandle {
         let raw = self.raw.expect("eddy: JoinHandle polled after completion");
         raw.header().state.ref_inc();
-        AbortHandle {
-            raw,
-            _not_send: PhantomData,
-        }
+        AbortHandle { raw }
     }
 }
 
@@ -122,8 +130,16 @@ impl<T> Drop for JoinHandle<T> {
 
 pub struct AbortHandle {
     raw: RawTask,
-    _not_send: PhantomData<std::rc::Rc<()>>,
 }
+
+// SAFETY: `AbortHandle` only touches the task header: `abort` is a state
+// transition plus a scheduler notification (which routes to the owning
+// thread for current-thread tasks), and refcounting is atomic. It never
+// reads or writes the possibly-`!Send` future or output.
+unsafe impl Send for AbortHandle {}
+// SAFETY: see `Send`; all operations are interior-mutating through the
+// shared header.
+unsafe impl Sync for AbortHandle {}
 
 impl AbortHandle {
     pub fn abort(&self) {
@@ -137,10 +153,7 @@ impl AbortHandle {
 impl Clone for AbortHandle {
     fn clone(&self) -> AbortHandle {
         self.raw.header().state.ref_inc();
-        AbortHandle {
-            raw: self.raw,
-            _not_send: PhantomData,
-        }
+        AbortHandle { raw: self.raw }
     }
 }
 
