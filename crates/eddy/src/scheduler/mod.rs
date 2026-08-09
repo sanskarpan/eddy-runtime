@@ -1,5 +1,8 @@
-//! Schedulers. Only the current-thread executor exists in this slice.
+//! Schedulers. The current-thread executor and Phase 4 queue primitives live
+//! here; the multi-thread worker loop will be layered on top of the queue.
 
 mod current_thread;
+mod multi_thread;
 
 pub(crate) use current_thread::CurrentThread;
+pub(crate) use multi_thread::{MultiThread, MultiThreadHandle, MultiThreadOptions};
