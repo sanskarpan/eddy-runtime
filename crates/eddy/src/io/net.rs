@@ -650,10 +650,15 @@ impl AsyncWrite for TcpStream {
         }
         let mut waiter = self.write_waiter.lock().unwrap();
         // L6: clamp to IOV_MAX; the kernel rejects larger vectored calls
-        // with EINVAL.
+        // with EINVAL. libc exposes it under different names: IOV_MAX on
+        // BSD/macOS, UIO_MAXIOV on Linux.
+        #[cfg(target_os = "linux")]
+        let max_iov = libc::UIO_MAXIOV;
+        #[cfg(not(target_os = "linux"))]
+        let max_iov = libc::IOV_MAX;
         let iov = bufs
             .iter()
-            .take(libc::IOV_MAX as usize)
+            .take(max_iov as usize)
             .map(|buf| libc::iovec {
                 iov_base: buf.as_ptr() as *mut libc::c_void,
                 iov_len: buf.len(),

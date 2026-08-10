@@ -28,6 +28,8 @@ pub(crate) struct Epoll {
 
 impl Drop for Epoll {
     fn drop(&mut self) {
+        // SAFETY: `ep` and `waker` are owned fds created in `Epoll::new`; this
+        // is the last use of the poller, so closing them cannot race.
         unsafe {
             libc::close(self.ep);
             libc::close(self.waker);
@@ -40,31 +42,31 @@ fn last_error() -> io::Error {
 }
 
 fn epoll_events(interest: Interest) -> u32 {
-    let mut events = libc::EPOLLRDHUP;
+    let mut events: u32 = libc::EPOLLRDHUP as u32;
     if interest.is_readable() {
-        events |= libc::EPOLLIN;
+        events |= libc::EPOLLIN as u32;
     }
     if interest.is_writable() {
-        events |= libc::EPOLLOUT;
+        events |= libc::EPOLLOUT as u32;
     }
     if interest.is_edge_triggered() {
-        events |= libc::EPOLLET;
+        events |= libc::EPOLLET as u32;
     }
     events
 }
 
 fn ready_from_epoll(events: u32) -> Ready {
     let mut ready = Ready::EMPTY;
-    if events & (libc::EPOLLIN | libc::EPOLLPRI) != 0 {
+    if events & (libc::EPOLLIN | libc::EPOLLPRI) as u32 != 0 {
         ready = ready.union(Ready::READABLE);
     }
-    if events & libc::EPOLLOUT != 0 {
+    if events & libc::EPOLLOUT as u32 != 0 {
         ready = ready.union(Ready::WRITABLE);
     }
-    if events & libc::EPOLLRDHUP != 0 {
+    if events & libc::EPOLLRDHUP as u32 != 0 {
         ready = ready.union(Ready::READ_CLOSED);
     }
-    if events & (libc::EPOLLHUP | libc::EPOLLERR) != 0 {
+    if events & (libc::EPOLLHUP | libc::EPOLLERR) as u32 != 0 {
         ready = ready.union(Ready::ERROR);
     }
     ready
@@ -80,6 +82,10 @@ impl Epoll {
         } else {
             std::ptr::null_mut()
         };
+        // SAFETY: `ep` is a valid epoll fd; `fd` is either a registered socket
+        // (this poller owns its interest) or, for `EPOLL_CTL_DEL`, a closed
+        // fd that the kernel ignores. `event_ptr` points at a live local
+        // `epoll_event` when an opcode needs one.
         let rc = unsafe { libc::epoll_ctl(self.ep, op, fd, event_ptr) };
         if rc == -1 {
             return Err(last_error());
@@ -90,12 +96,18 @@ impl Epoll {
 
 impl Poller for Epoll {
     fn new() -> io::Result<Epoll> {
+        // SAFETY: epoll_create1 takes no pointer arguments; the returned fd
+        // is stored in `self.ep` and closed in `Drop`.
         let ep = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
         if ep == -1 {
             return Err(last_error());
         }
+        // SAFETY: eventfd takes no pointer arguments; the returned fd is
+        // stored in `self.waker` and closed in `Drop`.
         let waker = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
         if waker == -1 {
+            // SAFETY: `ep` was created in this function and its registration
+            // failed, so nothing else can use it.
             unsafe { libc::close(ep) };
             return Err(last_error());
         }
@@ -125,6 +137,8 @@ impl Poller for Epoll {
         let timeout_ms = timeout
             .map(|duration| duration.as_millis().min(i32::MAX as u128) as i32)
             .unwrap_or(-1);
+        // SAFETY: `buf` is a live array of `MAX_EVENTS` `epoll_event`s large
+        // enough for any kernel fill; `self.ep` is a valid epoll fd.
         let n =
             unsafe { libc::epoll_wait(self.ep, buf.as_mut_ptr(), buf.len() as i32, timeout_ms) };
         if n == -1 {
@@ -138,6 +152,9 @@ impl Poller for Epoll {
                 // Drain the eventfd so it does not report again (it is
                 // edge-free and level-triggered would spin forever).
                 let mut count = 0u64;
+                // SAFETY: `count` is a live `u64` written by `read`; the
+                // eventfd has non-blocking mode and is drained only by this
+                // poller thread.
                 unsafe {
                     libc::read(
                         self.waker,
@@ -157,6 +174,9 @@ impl Poller for Epoll {
 
     fn wake(&self) -> io::Result<()> {
         let count = 1u64;
+        // SAFETY: `count` is a live `u64`; `self.waker` is the non-blocking
+        // eventfd registered at `WAKER_TOKEN`, and the 8-byte write never
+        // overflows the fd's internal counter.
         let rc = unsafe {
             libc::write(
                 self.waker,
