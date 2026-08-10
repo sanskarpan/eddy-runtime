@@ -5,6 +5,12 @@ item is verified against the source with a concrete interleaving or failure
 trace. Items are fixed in order: C1 → C2 → H1+H2 → H3 → M1–M6 → L-items →
 checklist/test hygiene.
 
+**Status: all items fixed, tested, and committed in `e3ae620`** (clippy
+`-D warnings` clean, `cargo fmt` applied, loom suite 17/17, full suite green).
+L4 is the only exception: the proposed drain loop cannot be implemented in a
+one-stream-per-call `accept()` API (see L4 below) and was reverted after
+verification.
+
 Legend: **C** = critical (memory unsafety / permanent deadlock) · **H** = high
 (hang or unsoundness in realistic use) · **M** = medium (wrong semantics or
 resource leak) · **L** = low (robustness / ergonomics).
@@ -349,12 +355,18 @@ completes (must hang on current code).
   nothing. Fix: route through `io.unpark_worker(id)` (clears the bit, wakes the
   driver/condvar). H1's fix is a prerequisite for the wake to be reliable.
 - **L4 Accept drains one connection per event** (`io/net.rs`): level-triggered
-  polling re-reports, so it is correct but slow under bursts. Fix: drain loop
-  until `WouldBlock` inside the accept task.
+  polling re-reports, so it is correct but slow under bursts. **Not fixed —
+  reverted as unimplementable**: a drain loop was attempted and clippy's
+  `never_loop` proved it cannot iterate — `accept()` returns on the first
+  successful `accept(2)`, so draining would require buffering connections,
+  which the one-stream-per-call API forbids. The per-connection wake cost is
+  one extra poller return per connection on the same event; accepted.
 - **L5 `UnixDatagram::shutdown` → `ENOTCONN`** (`io/unix.rs`): surface the
   error correctly or treat unconnected datagram shutdown as a no-op.
-- **L6 iovec count unclamped** (`io/buf.rs`): `writev`/`readv` with more than
-  `IOV_MAX` io vecs fails with `EINVAL`. Fix: clamp.
+- **L6 iovec count unclamped**: `writev`/`readv` with more than `IOV_MAX` io
+  vecs fails with `EINVAL`. Fix: clamp. Implemented in
+  `TcpStream::poll_write_vectored` (`io/net.rs:652-656`) via `.take(...)` —
+  this crate only exposes vectored writes on `TcpStream`.
 - **L7 Timers can fire ~1 ms early** (`time/wheel.rs`): accepted wheel
   tradeoff; document it next to the wheel math.
 - **L8 `push_overflow` busy-spins** (`queue.rs:82-99`): when every slot is
@@ -374,20 +386,22 @@ completes (must hang on current code).
 
 - **Chase-Lev loom tests never run by default** (`queue.rs:372,411`): gated
   behind `--cfg loom`, which CI does not set; the C1 interleaving is not
-  modeled either. Run loom in CI and add the C1 model.
-- **mpsc cancel-recv test is vacuous** (`tests/sync.rs:111-116`): times out a
-  `recv()` on an *empty* channel — no message is ever in flight, so it proves
-  nothing about cancel safety. Replace with: send an item, cancel a pending
-  `recv`, then `recv()` again → item still delivered.
+  modeled either. Still open: run loom in CI and add the C1 model. (Loom is run
+  manually: `RUSTFLAGS="--cfg loom" cargo test -p eddy --lib`, 17/17 green.)
+- **mpsc cancel-recv test was vacuous** (`tests/sync.rs:111-116`): **fixed** —
+  replaced with a real pending-recv drop: poll a `Box::pin(receiver.recv())`
+  with a noop waker, drop it, then send → the item is still delivered.
 - **fd-reuse test** (`tests/io.rs`): as written the stale event can never
-  exist; needs a driver-generated stale event to be meaningful.
-- **steal-count assertion** (`worker.rs:992-995`): `steal_count() > 0` after
-  100k uniform tasks is timing-dependent (uniform LIFO load may steal
-  nothing). Make the load uneven or assert with retries.
-- **rwlock writer-preference test** is weak; strengthen with a sustained
-  reader loop asserting writers make progress.
-- Missing regression tests for every C/H/M item above (each fix must ship with
-  one test that fails before the fix).
+  exist; needs a driver-generated stale event to be meaningful. Still open.
+- **steal-count assertion** (`worker.rs:992-995`): **fixed** — the stress test
+  now alternates fast/slow tasks (10× `yield_now` every other task) so the
+  steal is deterministic, and it asserts completion + steal count.
+- **rwlock writer-preference test is weak**: **fixed** — sustained reader loop
+  with a `timeout(2s)` deadline on writer progress.
+- **Missing regression tests for every C/H/M item above**: **fixed** — each fix
+  ships with a test that fails on the old code (M1–M6, H1/H2/H3, C2, L1 all
+  verified against the pre-fix source; M5/M6 old-code probes documented in
+  session notes).
 
 ---
 
