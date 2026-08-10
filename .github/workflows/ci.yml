@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt + clippy + tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy -p eddy --all-targets -- -D warnings
+      - name: Test
+        run: cargo test -p eddy --all-targets
+
+  loom:
+    # The Chase-Lev queue and injector are verified with loom; the model tests
+    # only compile under `--cfg loom`, so they need a dedicated run.
+    name: loom
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Loom model tests
+        env:
+          RUSTFLAGS: "--cfg loom"
+        run: cargo test -p eddy --lib

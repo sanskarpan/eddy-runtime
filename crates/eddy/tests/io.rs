@@ -126,12 +126,19 @@ fn ten_thousand_concurrent_registrations_all_wake() {
 fn fd_reuse_does_not_deliver_stale_events() {
     let rt = Builder::new_multi_thread().worker_threads(2).build();
     rt.block_on(async {
-        let (read1, _write1) = socketpair();
-        drop(Registration::new(read1, Interest::READABLE).unwrap());
+        let (read1, write1) = socketpair();
+        let reg1 = Registration::new(read1, Interest::READABLE).unwrap();
+        // Arm a genuine stale event: make the old registration readable and
+        // let the driver record readiness for its generation before the slot
+        // is freed (the poller returns events at ~1 ms granularity).
+        write_byte(&write1);
+        std::thread::sleep(Duration::from_millis(100));
 
-        // The slab slot is reused even when the OS assigns a different fd;
-        // generation matching, rather than numeric fd equality, is the safety
-        // property under test here.
+        // Free the slab slot, then reuse it with a fresh fd. `slab.insert`
+        // hands the new registration the same index (0) with a newer
+        // generation; its readiness must start from zero, never from the
+        // bits the driver recorded for the old registration.
+        drop(reg1);
         let (read2, write2) = socketpair();
 
         let reg = Arc::new(Registration::new(read2, Interest::READABLE).unwrap());
@@ -142,8 +149,8 @@ fn fd_reuse_does_not_deliver_stale_events() {
             let _event = task_reg.readiness(Interest::READABLE).await;
             woken_for_task.store(true, Ordering::SeqCst);
         });
-        // A stale event for the old registration (same slab slot, old
-        // generation) must not wake the new one.
+        // A stale event recorded for the old generation must not wake the new
+        // registration on the reused slot.
         std::thread::sleep(Duration::from_millis(150));
         assert!(!woken.load(Ordering::SeqCst), "stale event leaked through");
         write_byte(&write2);
@@ -201,9 +208,12 @@ fn spurious_readiness_is_cleared_and_rewait_parks() {
         let completed_for_task = completed.clone();
         let handle = eddy::Handle::current().spawn(async move {
             let first = task_reg.readiness(Interest::READABLE).await;
-            first.clear_ready();
-            // Drain the byte, making the readiness genuinely stale.
+            // Drain the byte BEFORE clearing: a level-triggered poller is
+            // free to re-report an fd that is still readable, so clearing
+            // first leaves a window where the driver legitimately re-records
+            // the event and the re-wait below fires without a new byte.
             read_byte(task_reg.as_raw_fd());
+            first.clear_ready();
             let second = task_reg.readiness(Interest::READABLE).await;
             second.clear_ready();
             completed_for_task.store(true, Ordering::SeqCst);
