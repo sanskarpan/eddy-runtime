@@ -214,6 +214,12 @@ impl ScheduledIo {
             if (packed >> GEN_SHIFT) as u32 != generation {
                 return;
             }
+            if ((packed & READY_MASK) >> READY_SHIFT) as u16 != ready.bits() {
+                // New readiness bits were reported since the event snapshot:
+                // the current state no longer matches what this event cleared,
+                // so leave it for the next poll.
+                return;
+            }
             let new = packed & !((ready.bits() as u64) << READY_SHIFT);
             match self.packed.compare_exchange_weak(
                 packed,
@@ -461,7 +467,9 @@ impl DriverShared {
             let weak = weak.clone();
             let notify = Arc::new(move || {
                 if let Some(driver) = weak.upgrade() {
-                    let _ = driver.poller.wake();
+                    let result = driver.poller.wake();
+                    debug_assert!(result.is_ok(), "eddy: driver wake failed: {result:?}");
+                    let _ = result;
                 }
             });
             DriverShared {
@@ -543,16 +551,28 @@ impl DriverShared {
         }
     }
 
-    /// Wake the poller wait of a specific worker, if that worker holds it.
-    /// Called after routing a task to it.
+    /// Make sure the driver re-runs so a task routed to the global injector
+    /// (or to a specific worker) is serviced. Called after routing a task.
+    ///
+    /// The wake must not depend on `id`'s driver state: the target thread may
+    /// be blocked in `thread::park()` (a nested `block_on`), not in the
+    /// driver at all. The injector is shared, so interrupting whichever
+    /// worker holds the kernel wait — or a condvar sleeper — is sufficient.
     pub(crate) fn unpark_worker(&self, id: usize) {
         let state = self.park.lock().unwrap();
-        if state.holder == Some(id) {
-            drop(state);
-            let _ = self.poller.wake();
-        } else if state.waiters > 0 {
+        if state.waiters > 0 {
             drop(state);
             self.park_condvar.notify_one();
+        } else {
+            // The holder, the target between re-check and holder claim, or a
+            // different worker holding the kernel wait: one spurious poller
+            // return and a work re-check is harmless (H1) and closes the
+            // window where the target parks outside the driver.
+            let _ = id;
+            drop(state);
+            let result = self.poller.wake();
+            debug_assert!(result.is_ok(), "eddy: driver wake failed: {result:?}");
+            let _ = result;
         }
     }
 
@@ -560,7 +580,9 @@ impl DriverShared {
     /// the kernel wait of the driver holder.
     pub(crate) fn unpark_all(&self) {
         self.park_condvar.notify_all();
-        let _ = self.poller.wake();
+        let result = self.poller.wake();
+        debug_assert!(result.is_ok(), "eddy: driver wake failed: {result:?}");
+        let _ = result;
     }
 
     pub(crate) fn timer_driver(&self) -> Arc<TimerShared> {
@@ -580,5 +602,31 @@ impl DriverShared {
             }
             scheduled.set_readiness_and_wake(event.ready);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clear_ready_does_not_consume_a_freshly_reported_event() {
+        let scheduled = Arc::new(ScheduledIo::new(7));
+        scheduled.set_readiness_and_wake(Ready::READABLE);
+        let event = scheduled
+            .readiness(Interest::READABLE)
+            .expect("readiness reported");
+        assert_eq!(event.ready(), Ready::READABLE);
+        scheduled.set_readiness_and_wake(Ready::WRITABLE);
+        event.clear_ready();
+        let now = scheduled.readiness(Interest::WRITABLE);
+        assert_eq!(
+            now.map(|event| event.ready()),
+            Some(Ready::READABLE.union(Ready::WRITABLE))
+        );
+        let stale = scheduled.readiness(Interest::READABLE).unwrap();
+        stale.clear_ready();
+        assert!(scheduled.readiness(Interest::WRITABLE).is_none());
+        assert!(scheduled.readiness(Interest::READABLE).is_none());
     }
 }

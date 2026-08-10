@@ -76,6 +76,18 @@ pub(crate) struct RawTask {
     pub(crate) header: NonNull<Header>,
 }
 
+// SAFETY: `RawTask` is a pointer to a task `Cell`. All shared state it can
+// reach (reference count, stage, trailer waker) is synchronized through
+// atomics, a mutex, and the vtable; a `!Send` future inside the cell is
+// never touched by a foreign thread because destruction is routed to the
+// scheduler's owning thread (`Schedule::is_owner_thread` /
+// `defer_dealloc`).
+unsafe impl Send for RawTask {}
+// SAFETY: `&RawTask` only exposes reads of the header's synchronized state
+// through `header()`; the vtable functions that mutate the cell are
+// exclusive to a single transition at a time.
+unsafe impl Sync for RawTask {}
+
 impl RawTask {
     /// Allocates one `Cell<F, S>`, initializes it, and returns the raw
     /// handle. Caller (spawn) owns both references baked into the initial

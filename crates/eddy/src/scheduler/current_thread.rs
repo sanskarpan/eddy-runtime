@@ -23,7 +23,7 @@ struct Inner {
     deferred: Mutex<VecDeque<Notified<CurrentThread>>>,
     owner: Mutex<Option<ThreadId>>,
     owner_thread: ThreadId,
-    unparker: Mutex<Option<Thread>>,
+    unparker: Arc<Mutex<Option<Thread>>>,
     tick: AtomicU32,
     tasks: Mutex<Vec<RawTask>>,
     closed: AtomicBool,
@@ -32,28 +32,35 @@ struct Inner {
     blocking: BlockingPool,
 }
 
-// SAFETY: every shared queue and lifecycle field is protected by its Mutex or
-// atomic. `Notified` moves only a raw task pointer; polling and destruction are
-// routed back to the owner thread by `CurrentThread`.
-unsafe impl Send for Inner {}
-// SAFETY: the same queue and lifecycle synchronization guarantees apply to
-// shared references to `Inner`.
-unsafe impl Sync for Inner {}
+// `Inner` is plain `Send + Sync` (every field is behind a Mutex or an
+// atomic; `Notified` moves only a raw task pointer). Cross-thread wakes are
+// safe: they only enqueue and unpark, never touching a `!Send` future. The
+// `!Send + !Sync` confinement lives on `Runtime` itself (runtime/mod.rs),
+// because `shutdown` polls and destroys `!Send` futures on the drop thread.
 
 #[derive(Clone)]
 pub(crate) struct CurrentThread(Arc<Inner>);
 
 impl CurrentThread {
     pub(crate) fn new(max_blocking_threads: usize, keep_alive: Duration) -> CurrentThread {
-        let owner_thread = std::thread::current();
-        let timer = TimerShared::new(Arc::new(move || owner_thread.unpark()));
+        // The unparker slot records the thread currently in `block_on`,
+        // which need not be the construction thread; the timer notifier must
+        // therefore read the slot at fire time rather than capture the
+        // construction thread.
+        let unparker = Arc::new(Mutex::new(None::<Thread>));
+        let unparker_for_timer = unparker.clone();
+        let timer = TimerShared::new(Arc::new(move || {
+            if let Some(thread) = unparker_for_timer.lock().unwrap().clone() {
+                thread.unpark();
+            }
+        }));
         CurrentThread(Arc::new(Inner {
             local: Mutex::new(VecDeque::new()),
             injection: Mutex::new(VecDeque::new()),
             deferred: Mutex::new(VecDeque::new()),
             owner: Mutex::new(None),
             owner_thread: std::thread::current().id(),
-            unparker: Mutex::new(None),
+            unparker,
             tick: AtomicU32::new(0),
             tasks: Mutex::new(Vec::new()),
             closed: AtomicBool::new(false),
@@ -502,5 +509,43 @@ mod tests {
         });
         assert!(task_ran.load(Ordering::Acquire));
         assert_eq!(polls.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn timer_notify_unparks_the_block_on_thread_not_the_construction_thread() {
+        // H3 regression: the timer notifier reads the `unparker` slot at
+        // fire time, so a timer armed by a foreign (blocking-pool) thread
+        // wakes the thread currently in `block_on`, even when that differs
+        // from the construction thread. The old closure captured the
+        // construction thread and its wake was lost. (The wheel's
+        // park_timeout bounds most parks, so this guards the empty-wheel
+        // window rather than a deterministic old-code hang.)
+        let rt = CurrentThread::new(
+            crate::blocking::DEFAULT_MAX_BLOCKING_THREADS,
+            crate::blocking::DEFAULT_KEEP_ALIVE,
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        let done = std::thread::spawn(move || {
+            rt.block_on(async {
+                // Arm a timer from the blocking-pool thread while this
+                // thread is parked, then complete via the normal wake path.
+                let handle = crate::runtime::Handle::current().spawn_blocking(move || {
+                    let mut sleep =
+                        std::pin::pin!(crate::time::sleep(std::time::Duration::from_millis(30)));
+                    let waker = std::task::Waker::noop();
+                    let mut cx = Context::from_waker(waker);
+                    let _ = sleep.as_mut().poll(&mut cx);
+                });
+                handle.await.unwrap();
+            });
+            tx.send(()).unwrap();
+        });
+        // The block_on thread parks with an empty wheel and no timeout while
+        // the pool thread arms the timer; the arm's notify must hit the
+        // block_on thread (unparker slot), not the construction thread.
+        // Bounded by recv_timeout so a lost wake fails instead of hanging.
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("H3: block_on thread was never woken after a foreign timer arm");
+        done.join().unwrap();
     }
 }

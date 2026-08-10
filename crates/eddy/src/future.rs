@@ -120,6 +120,83 @@ where
 }
 
 pin_project! {
+    pub struct TryJoin3<A: Future, B: Future, C: Future> {
+        #[pin]
+        a: A,
+        #[pin]
+        b: B,
+        #[pin]
+        c: C,
+        a_output: Option<A::Output>,
+        b_output: Option<B::Output>,
+        c_output: Option<C::Output>,
+    }
+}
+
+impl<A, B, C, TA, TB, TC, E> Future for TryJoin3<A, B, C>
+where
+    A: Future<Output = Result<TA, E>>,
+    B: Future<Output = Result<TB, E>>,
+    C: Future<Output = Result<TC, E>>,
+{
+    type Output = Result<(TA, TB, TC), E>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut this = self.project();
+        if this.a_output.is_none() {
+            match this.a.as_mut().poll(cx) {
+                Poll::Ready(Ok(output)) => *this.a_output = Some(Ok(output)),
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => {}
+            }
+        }
+        if this.b_output.is_none() {
+            match this.b.as_mut().poll(cx) {
+                Poll::Ready(Ok(output)) => *this.b_output = Some(Ok(output)),
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => {}
+            }
+        }
+        if this.c_output.is_none() {
+            match this.c.as_mut().poll(cx) {
+                Poll::Ready(Ok(output)) => *this.c_output = Some(Ok(output)),
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => {}
+            }
+        }
+        match (
+            this.a_output.take(),
+            this.b_output.take(),
+            this.c_output.take(),
+        ) {
+            (Some(Ok(a)), Some(Ok(b)), Some(Ok(c))) => Poll::Ready(Ok((a, b, c))),
+            (a, b, c) => {
+                *this.a_output = a;
+                *this.b_output = b;
+                *this.c_output = c;
+                Poll::Pending
+            }
+        }
+    }
+}
+
+pub fn try_join3<A, B, C, TA, TB, TC, E>(a: A, b: B, c: C) -> TryJoin3<A, B, C>
+where
+    A: Future<Output = Result<TA, E>>,
+    B: Future<Output = Result<TB, E>>,
+    C: Future<Output = Result<TC, E>>,
+{
+    TryJoin3 {
+        a,
+        b,
+        c,
+        a_output: None,
+        b_output: None,
+        c_output: None,
+    }
+}
+
+pin_project! {
 pub struct Select2<A, B> {
         #[pin]
         a: A,
@@ -237,6 +314,11 @@ impl Future for YieldNow {
     }
 }
 
+/// Wait for two or three futures, resolving with all of their outputs.
+///
+/// L9: unlike `std::future::join!` this is not variadic — it supports only 2
+/// or 3 arguments. Nest additional futures (`join!(join!(a, b, c), d)`) for
+/// more, at the cost of one extra layer of awaits.
 #[macro_export]
 macro_rules! join {
     ($a:expr, $b:expr $(,)?) => {
@@ -250,19 +332,16 @@ macro_rules! join {
     };
 }
 
+/// Wait for two or three `Result` futures, resolving with the first error
+/// (short-circuiting) or the tuple of outputs. Supports only 2 or 3
+/// arguments (L9); nest or use `select!` for larger sets.
 #[macro_export]
 macro_rules! try_join {
     ($a:expr, $b:expr $(,)?) => {
         $crate::future::try_join2($a, $b)
     };
     ($a:expr, $b:expr, $c:expr $(,)?) => {
-        async {
-            let ((a, b), c) = $crate::future::join2($crate::future::join2($a, $b), $c).await;
-            let a = a?;
-            let b = b?;
-            let c = c?;
-            Ok::<_, _>((a, b, c))
-        }
+        $crate::future::try_join3($a, $b, $c)
     };
 }
 

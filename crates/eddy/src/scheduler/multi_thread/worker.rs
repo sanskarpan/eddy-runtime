@@ -139,7 +139,7 @@ impl IdleState {
     }
 
     /// Wake one parked worker, if any. Double-unparks are harmless: the
-    /// thread park is sticky.
+    /// driver wake is sticky.
     fn unpark_any(&self, shared: &Shared) {
         let parked = self.parked.load(Ordering::SeqCst);
         if parked == 0 {
@@ -150,9 +150,10 @@ impl IdleState {
             return;
         }
         self.parked.fetch_and(!(1 << id), Ordering::SeqCst);
-        if let Some(thread) = shared.workers[id].thread.lock().unwrap().as_ref() {
-            thread.unpark();
-        }
+        // L3: workers block in `park_worker`, never in `thread::park()`, so
+        // route through the driver (holder wake / condvar notify / stale
+        // wake) instead of an inert `thread::unpark`.
+        shared.io.unpark_worker(id);
     }
 }
 
@@ -276,6 +277,11 @@ impl MultiThread {
     }
 
     pub(crate) fn block_on<F: Future>(&self, future: F) -> F::Output {
+        // A worker calling `block_on` (nested) must not keep its identity:
+        // spawns inside the root future would route to this thread's local
+        // queue, which only `worker_loop` services — and this thread is
+        // blocked here. Clear it for the duration, as `block_in_place` does.
+        let was_worker = WORKER_ID.with(|worker_id| worker_id.take());
         let scheduler = MultiThreadHandle {
             shared: self.shared.clone(),
             target: self.shared.next_worker.fetch_add(1, Ordering::Relaxed)
@@ -291,14 +297,18 @@ impl MultiThread {
         let mut cx = std::task::Context::from_waker(&waker);
         let mut future = std::pin::pin!(future);
 
-        loop {
+        let output = loop {
             if signal.woken.swap(false, Ordering::Acquire) {
                 if let std::task::Poll::Ready(output) = future.as_mut().poll(&mut cx) {
-                    return output;
+                    break output;
                 }
             }
             thread::park();
+        };
+        if let Some(id) = was_worker {
+            WORKER_ID.with(|worker_id| worker_id.set(Some(id)));
         }
+        output
     }
 
     /// Run `fut` on the calling thread. On a worker thread the run queue is
@@ -478,18 +488,12 @@ impl Schedule for MultiThreadHandle {
 
 impl MultiThreadHandle {
     fn unpark_target(&self) {
-        // The thread-level unpark is sticky and covers the window where the
-        // target is not yet inside either park; the driver signal interrupts
-        // the kernel wait when the target is the driver holder, and the
-        // condvar notify wakes it when it is a condvar sleeper.
-        if let Some(thread) = self.shared.workers[self.target]
-            .thread
-            .lock()
-            .unwrap()
-            .as_ref()
-        {
-            thread.unpark();
-        }
+        // Workers park in the driver's `park_worker` (kernel readiness wait
+        // or condvar), never in `thread::park()`, so the driver signal is
+        // the only wake that matters: it interrupts the kernel wait when the
+        // target is the driver holder, the condvar notify wakes it when it
+        // is a condvar sleeper, and `unpark_worker` additionally covers the
+        // window where the target has claimed neither yet.
         self.shared.io.unpark_worker(self.target);
     }
 }
@@ -663,29 +667,32 @@ fn block_in_place_on_worker<F: Future>(shared: &Arc<Shared>, id: usize, fut: F) 
     *shared.workers[id].thread.lock().unwrap() = Some(thread.thread().clone());
     *takeover.thread.lock().unwrap() = Some(thread);
 
-    let signal = Arc::new(RootSignal {
-        thread: thread::current(),
-        woken: AtomicBool::new(true),
-    });
-    let waker = root_waker(signal.clone());
-    let mut cx = std::task::Context::from_waker(&waker);
-    let mut fut = std::pin::pin!(fut);
-    let output = loop {
-        if signal.woken.swap(false, Ordering::Acquire) {
-            if let std::task::Poll::Ready(output) = fut.as_mut().poll(&mut cx) {
-                break output;
+    // Poll the future to completion on this thread. A panic must still run
+    // the hand-back below: the takeover thread keeps servicing the queue
+    // until `requested` is set, so skipping it would leave two threads
+    // touching one `UnsafeCell` queue.
+    let output = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let signal = Arc::new(RootSignal {
+            thread: thread::current(),
+            woken: AtomicBool::new(true),
+        });
+        let waker = root_waker(signal.clone());
+        let mut cx = std::task::Context::from_waker(&waker);
+        let mut fut = std::pin::pin!(fut);
+        loop {
+            if signal.woken.swap(false, Ordering::Acquire) {
+                if let std::task::Poll::Ready(output) = fut.as_mut().poll(&mut cx) {
+                    return output;
+                }
             }
+            thread::park();
         }
-        thread::park();
-    };
+    }));
 
-    // Ask for the queue back, waking the takeover thread at both the
-    // thread level and the driver level in case it is inside a kernel
-    // readiness wait.
+    // Ask for the queue back, waking the takeover thread at the driver
+    // level in case it is inside a kernel readiness wait; `unpark_worker`
+    // also covers the takeover thread not having claimed the holder yet.
     takeover.requested.store(true, Ordering::Release);
-    if let Some(thread) = shared.workers[id].thread.lock().unwrap().as_ref() {
-        thread.unpark();
-    }
     shared.io.unpark_worker(id);
     let queue = {
         let mut state = takeover.queue.lock().unwrap();
@@ -707,7 +714,11 @@ fn block_in_place_on_worker<F: Future>(shared: &Arc<Shared>, id: usize, fut: F) 
     if let Some(thread) = takeover.thread.lock().unwrap().take() {
         thread.join().expect("eddy: takeover thread panicked");
     }
-    output
+
+    match output {
+        Ok(output) => output,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
 }
 
 /// Poll `fut` in place on a thread that is not a worker (e.g. the `block_on`
@@ -795,10 +806,10 @@ fn take_injected(shared: &Shared, id: usize) -> Option<Notified<MultiThreadHandl
     let queue = unsafe { &mut *shared.workers[id].queue.get() };
     match queue.push_back(task) {
         Ok(()) => queue.pop(),
-        Err(task) => {
-            shared.inject.push(task);
-            None
-        }
+        // L10: the local queue is full; run the popped task directly instead
+        // of re-pushing to the injector (which would hide it from thieves
+        // for no benefit and force a second injector pop).
+        Err(task) => Some(task),
     }
 }
 
@@ -977,9 +988,20 @@ mod tests {
         let rt = MultiThread::new(8);
         let counter = Arc::new(AtomicI32::new(0));
         let mut handles = Vec::new();
-        for _ in 0..100_000 {
+        // Test hygiene: alternate fast and slow tasks. Round-robin routing
+        // sends one parity to odd workers and the other to even workers, so
+        // the fast workers drain their share and must steal from the
+        // still-loaded slow workers — a deterministic steal, unlike the
+        // previous uniform load which could complete without any stealing.
+        for i in 0..100_000 {
             let counter = counter.clone();
+            let slow = i % 2 == 0;
             handles.push(rt.spawn(async move {
+                if slow {
+                    for _ in 0..10 {
+                        crate::future::yield_now().await;
+                    }
+                }
                 counter.fetch_add(1, Ordering::SeqCst);
             }));
         }

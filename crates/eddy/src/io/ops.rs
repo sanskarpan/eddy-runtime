@@ -45,6 +45,7 @@ struct DirectionState {
     pos: usize,
     eof: bool,
     copied: u64,
+    dst_shutdown: bool,
 }
 
 impl DirectionState {
@@ -55,6 +56,7 @@ impl DirectionState {
             pos: 0,
             eof: false,
             copied: 0,
+            dst_shutdown: false,
         }
     }
 }
@@ -94,6 +96,13 @@ where
         }
 
         if state.eof {
+            if !state.dst_shutdown {
+                match Pin::new(&mut *dst).poll_shutdown(cx) {
+                    Poll::Pending => return Poll::Ready(Ok(DirectionPoll::Pending)),
+                    Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                    Poll::Ready(Ok(())) => state.dst_shutdown = true,
+                }
+            }
             return Poll::Ready(Ok(DirectionPoll::Done));
         }
 
@@ -105,8 +114,10 @@ where
                 state.filled = read_buf.filled_len();
                 state.pos = 0;
                 if state.filled == 0 {
+                    // EOF on the source: half-close the destination so the
+                    // peer observes end-of-stream, then let the loop's eof
+                    // branch drive `poll_shutdown` to completion.
                     state.eof = true;
-                    return Poll::Ready(Ok(DirectionPoll::Done));
                 }
             }
         }

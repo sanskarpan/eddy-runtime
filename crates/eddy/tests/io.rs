@@ -6,7 +6,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use eddy::io::{Interest, Registration};
+use eddy::io::{
+    copy_bidirectional, AsyncReadExt, AsyncWriteExt, Interest, Registration, TcpListener, TcpStream,
+};
+use eddy::time::timeout;
 use eddy::Builder;
 
 fn socketpair() -> (OwnedFd, OwnedFd) {
@@ -265,5 +268,53 @@ fn two_tasks_on_one_registration_both_are_woken() {
             handle.await.unwrap();
         }
         assert_eq!(done.load(Ordering::SeqCst), 2);
+    });
+}
+
+#[test]
+fn copy_bidirectional_half_closes_destination_on_eof() {
+    let rt = Builder::new_multi_thread().worker_threads(2).build();
+    rt.block_on(async {
+        let listener_left = TcpListener::bind("127.0.0.1:0").unwrap();
+        let left_addr = listener_left.local_addr().unwrap();
+        let listener_right = TcpListener::bind("127.0.0.1:0").unwrap();
+        let right_addr = listener_right.local_addr().unwrap();
+
+        // Left peer: send a message, then half-close its write side so `left`
+        // observes EOF while the connection stays open.
+        let left_server = eddy::Handle::current().spawn(async move {
+            let (mut stream, _) = listener_left.accept().await.unwrap();
+            stream.write_all(b"hello").await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+
+        // Right peer: keep reading until it observes EOF from the copy. This
+        // only happens if `right`'s write side is shut down at the end of the
+        // copy; the old code never half-closed the destination and hung here.
+        let right_server = eddy::Handle::current().spawn(async move {
+            let (stream, _) = listener_right.accept().await.unwrap();
+            let (mut read, _write) = stream.into_split();
+            let mut buf = Vec::new();
+            read.read_to_end(&mut buf).await.unwrap();
+            buf
+        });
+
+        let mut left = TcpStream::connect(left_addr).await.unwrap();
+        let mut right = TcpStream::connect(right_addr).await.unwrap();
+        let result = timeout(
+            Duration::from_secs(5),
+            copy_bidirectional(&mut left, &mut right),
+        )
+        .await;
+        match result {
+            Ok(Ok((to_right, to_left))) => {
+                assert_eq!(to_right, 5);
+                assert_eq!(to_left, 0);
+            }
+            Ok(Err(error)) => panic!("copy_bidirectional failed: {error}"),
+            Err(_) => panic!("copy_bidirectional hung: destination never half-closed"),
+        }
+        left_server.await.unwrap();
+        assert_eq!(right_server.await.unwrap(), b"hello");
     });
 }

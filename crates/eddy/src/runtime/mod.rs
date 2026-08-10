@@ -2,6 +2,8 @@
 
 use std::cell::RefCell;
 use std::future::Future;
+use std::marker::PhantomData;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::blocking::{DEFAULT_KEEP_ALIVE, DEFAULT_MAX_BLOCKING_THREADS};
@@ -164,6 +166,10 @@ impl Drop for EnterGuard {
 
 pub struct Runtime {
     scheduler: Scheduler,
+    // H3: `Runtime` must never cross threads — a current-thread runtime
+    // polls and destroys `!Send` futures on its drop thread, and its driver
+    // resources are thread-bound. Sharing happens through `Handle`.
+    _not_send_sync: PhantomData<Rc<()>>,
 }
 
 impl Runtime {
@@ -378,7 +384,10 @@ impl Builder {
                 on_thread_unpark: self.on_thread_unpark,
             })),
         };
-        Runtime { scheduler }
+        Runtime {
+            scheduler,
+            _not_send_sync: PhantomData,
+        }
     }
 }
 
@@ -412,5 +421,34 @@ mod tests {
         let rt = Builder::new_current_thread().build();
         let ok = rt.block_on(async { Handle::current().spawn(async { 1 }).await.unwrap() == 1 });
         assert!(ok);
+    }
+
+    #[test]
+    fn block_on_from_a_worker_thread_runs_tasks_spawned_inside() {
+        // M6 regression: a nested `block_on` on a worker thread must clear
+        // the worker identity so spawns inside it route to real workers
+        // instead of the caller's local queue, which nothing services while
+        // this thread is blocked.
+        let rt = Builder::new_multi_thread().worker_threads(2).build();
+        rt.block_on(async {
+            let handle = Handle::current();
+            let scheduler = handle.scheduler.clone();
+            let spawn_handle = handle.clone();
+            let result = handle.spawn(async move {
+                let scheduler = match scheduler {
+                    Scheduler::Multi(scheduler) => scheduler,
+                    Scheduler::Current(_) => unreachable!(),
+                };
+                crate::time::timeout(std::time::Duration::from_secs(5), async move {
+                    scheduler.block_on(async {
+                        let spawned = spawn_handle.spawn(async { 6 * 7 });
+                        spawned.await.unwrap()
+                    })
+                })
+                .await
+                .expect("nested block_on from a worker hung on its own spawns")
+            });
+            assert_eq!(result.await.unwrap(), 42);
+        });
     }
 }

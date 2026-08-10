@@ -387,7 +387,15 @@ impl AsyncWrite for UnixDatagram {
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // L5: an unconnected datagram socket reports `ENOTCONN` for
+        // `shutdown(2)`; there is no write half to shut down, so treat that
+        // as a successful no-op rather than surfacing a confusing error.
         // SAFETY: `inner` is structurally pinned with `self`.
-        unsafe { self.map_unchecked_mut(|socket| &mut socket.inner) }.poll_shutdown(cx)
+        match unsafe { self.map_unchecked_mut(|socket| &mut socket.inner) }.poll_shutdown(cx) {
+            Poll::Ready(Err(error)) if error.raw_os_error() == Some(libc::ENOTCONN) => {
+                Poll::Ready(Ok(()))
+            }
+            poll => poll,
+        }
     }
 }

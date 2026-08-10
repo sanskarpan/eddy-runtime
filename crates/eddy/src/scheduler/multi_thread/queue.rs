@@ -5,6 +5,13 @@
 //! reservation. `real_head` is the committed head and `steal_head` is the
 //! reservation frontier. Packing both into one atomic word lets the owner see
 //! a consistent snapshot while a steal is in flight.
+//!
+//! A claimed-but-uncommitted range is still physically occupied: the thief
+//! reads its slots between the claim CAS and the commit, so the owner must
+//! never push into it. Commits therefore land **in order**: each thief
+//! advances `real_head` from the claim's start to its end, and retries until
+//! every earlier claim has committed. This keeps `real_head` from ever
+//! passing a slot that a thief has not finished copying.
 
 #![allow(dead_code)]
 
@@ -61,7 +68,9 @@ impl<T: 'static, const CAP: usize> Local<T, CAP> {
         }
 
         // SAFETY: only the owner writes this slot, and the capacity check
-        // proves that no live element occupies it.
+        // proves that no live element occupies it. The check uses the
+        // *committed* head: a claimed-but-uncommitted range is still being
+        // read by its thief, so it counts as occupied until its commit lands.
         unsafe { (*self.slot(tail).get()).write(value) };
         // Release publishes the initialized slot to a thief that acquires the
         // tail after observing a matching head snapshot.
@@ -82,16 +91,28 @@ impl<T: 'static, const CAP: usize> Local<T, CAP> {
     pub(crate) fn push_overflow(&mut self, value: T, overflow: &mut Vec<T>) {
         let mut staging = Local::<T, LOCAL_QUEUE_CAPACITY>::new();
         let mut pending = Some(value);
+        let mut unproductive = 0;
         loop {
             match self.push_back(pending.take().expect("eddy: overflow lost the task")) {
                 Ok(()) => return,
                 Err(value) => {
-                    if let Some(first) = self.steal_into(&mut staging) {
-                        overflow.push(first);
-                    }
+                    let Some(first) = self.steal_into(&mut staging) else {
+                        // L8: every slot is claimed-but-uncommitted, so neither
+                        // push nor steal can make progress; commits are
+                        // imminent, so yield instead of spinning hot.
+                        unproductive += 1;
+                        if unproductive >= 16 {
+                            std::thread::yield_now();
+                            unproductive = 0;
+                        }
+                        pending = Some(value);
+                        continue;
+                    };
+                    overflow.push(first);
                     while let Some(item) = staging.pop() {
                         overflow.push(item);
                     }
+                    unproductive = 0;
                     pending = Some(value);
                 }
             }
@@ -195,7 +216,7 @@ impl<T: 'static, const CAP: usize> Local<T, CAP> {
                 }
             }
 
-            self.commit_real_head(claimed_end);
+            self.commit_real_head(steal_head, claimed_end);
             return first;
         }
     }
@@ -216,24 +237,39 @@ impl<T: 'static, const CAP: usize> Local<T, CAP> {
         &self.inner.buffer[(index & (CAP as u32 - 1)) as usize]
     }
 
-    fn commit_real_head(&self, claimed_end: u32) {
+    /// Commit `real_head` forward to `claimed_end` for a claim that started
+    /// at `claim_start` (the `steal_head` observed when the claim was made).
+    ///
+    /// Commits land in order: the CAS only succeeds when `real_head` still
+    /// equals `claim_start`, i.e. every earlier claim has already committed.
+    /// Otherwise the thief retries. This is what keeps the owner from
+    /// reusing slots that an in-flight thief has claimed but not finished
+    /// copying — were `real_head` to jump over the claim, the owner would
+    /// treat the thief's slots as free and overwrite them mid-copy.
+    fn commit_real_head(&self, claim_start: u32, claimed_end: u32) {
         loop {
             let current = self.inner.head.load(Ordering::Acquire);
             let (steal_head, real_head) = unpack(current);
-            let distance = claimed_end.wrapping_sub(real_head) as usize;
-            if distance == 0 || distance > LOCAL_QUEUE_CAPACITY {
+            if real_head == claimed_end {
                 return;
             }
-
+            // The CAS succeeds only while `real_head` still equals
+            // `claim_start`, i.e. every earlier claim has already committed;
+            // otherwise it fails and the loop retries. An earlier claim's
+            // commit can therefore never be skipped.
+            let expected = pack(steal_head, claim_start);
             let desired = pack(steal_head, claimed_end);
             if self
                 .inner
                 .head
-                .compare_exchange(current, desired, Ordering::Release, Ordering::Acquire)
+                .compare_exchange(expected, desired, Ordering::Release, Ordering::Acquire)
                 .is_ok()
             {
                 return;
             }
+            // The commit must wait for an earlier claim to land. Yield so
+            // the earlier thief can finish instead of burning the CPU.
+            crate::loom::thread::yield_now();
         }
     }
 }
@@ -439,6 +475,63 @@ mod loom_tests {
             values.extend(overflow);
             values.sort_unstable();
             assert_eq!(values, vec![0, 1, 2, 3, 99]);
+        });
+    }
+
+    #[test]
+    fn owner_push_back_never_reuses_a_slot_claimed_by_an_unfinished_steal() {
+        // C1 regression: two thieves claim overlapping-frontier ranges while
+        // the owner pushes. If a commit jumps `real_head` past a claim that
+        // is still being copied, the owner pushes into the thief's slot and
+        // the task is either duplicated (owner + thief both run it) or lost.
+        loom::model(|| {
+            let mut owner = Local::<u32, 4>::new();
+            for value in 0..4 {
+                owner.push_back(value).unwrap();
+            }
+            let thief_a = owner.clone();
+            let thief_b = owner.clone();
+            let a = thread::spawn(move || {
+                let mut destination = Local::<u32, 4>::new();
+                let mut values = Vec::new();
+                if let Some(first) = thief_a.steal_into(&mut destination) {
+                    values.push(first);
+                }
+                while let Some(value) = destination.pop() {
+                    values.push(value);
+                }
+                values
+            });
+            let b = thread::spawn(move || {
+                let mut destination = Local::<u32, 4>::new();
+                let mut values = Vec::new();
+                if let Some(first) = thief_b.steal_into(&mut destination) {
+                    values.push(first);
+                }
+                while let Some(value) = destination.pop() {
+                    values.push(value);
+                }
+                values
+            });
+
+            // The queue is full (with claims possibly in flight), so pushes
+            // may legitimately be rejected; every accepted value must still
+            // appear exactly once.
+            let mut rejected = Vec::new();
+            for value in 4..8 {
+                if owner.push_back(value).is_err() {
+                    rejected.push(value);
+                }
+            }
+
+            let mut values = a.join().unwrap();
+            values.extend(b.join().unwrap());
+            while let Some(value) = owner.pop() {
+                values.push(value);
+            }
+            values.extend(rejected);
+            values.sort_unstable();
+            assert_eq!(values, (0..8).collect::<Vec<_>>());
         });
     }
 }

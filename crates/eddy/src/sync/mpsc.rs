@@ -7,13 +7,18 @@ use std::task::{Context, Poll, Waker};
 
 struct Waiter {
     granted: AtomicBool,
+    /// Whether this waiter holds a reservation slot once granted. A `Reserve`
+    /// waiter counts its slot in `State::reserved` at grant time; a plain
+    /// `Send` waiter does not.
+    reserves: bool,
     waker: Mutex<Option<Waker>>,
 }
 
 impl Waiter {
-    fn new() -> Arc<Waiter> {
+    fn new(reserves: bool) -> Arc<Waiter> {
         Arc::new(Waiter {
             granted: AtomicBool::new(false),
+            reserves,
             waker: Mutex::new(None),
         })
     }
@@ -114,12 +119,14 @@ fn wake_receiver<T>(state: &mut State<T>) {
     }
 }
 
-fn wake_one_sender<T>(state: &mut State<T>, reserve: bool) {
+fn wake_one_sender<T>(state: &mut State<T>) {
     if !capacity_available(state) {
         return;
     }
     if let Some(waiter) = state.send_waiters.pop_front() {
-        if reserve {
+        // The reservation is counted exactly once per granted `Reserve`
+        // waiter, here at grant time; `Reserve::poll` never increments again.
+        if waiter.reserves {
             state.reserved += 1;
         }
         waiter.granted.store(true, Ordering::Release);
@@ -143,7 +150,7 @@ impl<T> Sender<T> {
         Send {
             inner: self.inner.clone(),
             item: Some(item),
-            waiter: Waiter::new(),
+            waiter: Waiter::new(false),
             registered: false,
             marker: std::marker::PhantomData,
         }
@@ -152,7 +159,7 @@ impl<T> Sender<T> {
     pub fn reserve(&self) -> Reserve<'_, T> {
         Reserve {
             inner: self.inner.clone(),
-            waiter: Waiter::new(),
+            waiter: Waiter::new(true),
             registered: false,
             marker: std::marker::PhantomData,
         }
@@ -201,17 +208,21 @@ impl<T> Future for Send<'_, T> {
         if !state.receiver_alive {
             return Poll::Ready(Err(SendError(this.item.take().unwrap())));
         }
-        let at_head = state
-            .send_waiters
-            .front()
-            .is_some_and(|waiter| Arc::ptr_eq(waiter, &this.waiter));
         let granted = this.waiter.granted.swap(false, Ordering::Acquire);
-        if (granted || (!this.registered && state.send_waiters.is_empty()))
-            && capacity_available(&state)
-            && (granted || at_head || !this.registered)
-        {
+        if granted && capacity_available(&state) {
             state.queue.push_back(this.item.take().unwrap());
             this.registered = false;
+            wake_receiver(&mut state);
+            return Poll::Ready(Ok(()));
+        }
+        if granted {
+            // The grant was lost to a competing push that refilled the
+            // channel; re-register from scratch so the next freed slot is
+            // offered to this waiter again.
+            this.registered = false;
+        }
+        if !this.registered && state.send_waiters.is_empty() && capacity_available(&state) {
+            state.queue.push_back(this.item.take().unwrap());
             wake_receiver(&mut state);
             return Poll::Ready(Ok(()));
         }
@@ -234,7 +245,7 @@ impl<T> Drop for Send<'_, T> {
                 .retain(|waiter| !Arc::ptr_eq(waiter, &self.waiter));
         }
         if granted {
-            wake_one_sender(&mut state, false);
+            wake_one_sender(&mut state);
         }
     }
 }
@@ -250,17 +261,18 @@ impl<T> Future for Reserve<'_, T> {
         if !state.receiver_alive {
             return Poll::Ready(Err(RecvError));
         }
-        let at_head = state
-            .send_waiters
-            .front()
-            .is_some_and(|waiter| Arc::ptr_eq(waiter, &this.waiter));
         let granted = this.waiter.granted.swap(false, Ordering::Acquire);
-        if (granted || (!this.registered && state.send_waiters.is_empty()))
-            && capacity_available(&state)
-            && (granted || at_head || !this.registered)
-        {
-            state.reserved += 1;
+        if granted {
+            // `wake_one_sender` already counted this reservation at grant
+            // time, so the permit is valid even if the queue is momentarily
+            // full; the reservation guarantees the slot.
             this.registered = false;
+            return Poll::Ready(Ok(Permit {
+                inner: Some(this.inner.clone()),
+            }));
+        }
+        if !this.registered && state.send_waiters.is_empty() && capacity_available(&state) {
+            state.reserved += 1;
             return Poll::Ready(Ok(Permit {
                 inner: Some(this.inner.clone()),
             }));
@@ -284,7 +296,11 @@ impl<T> Drop for Reserve<'_, T> {
                 .retain(|waiter| !Arc::ptr_eq(waiter, &self.waiter));
         }
         if granted {
-            wake_one_sender(&mut state, true);
+            // A granted-but-never-polled reservation still holds its slot
+            // (counted by `wake_one_sender`): release it before offering the
+            // freed slot to the next waiter.
+            state.reserved -= 1;
+            wake_one_sender(&mut state);
         }
     }
 }
@@ -310,7 +326,7 @@ impl<T> Drop for Permit<T> {
         };
         let mut state = inner.state.lock().unwrap();
         state.reserved -= 1;
-        wake_one_sender(&mut state, true);
+        wake_one_sender(&mut state);
     }
 }
 
@@ -343,7 +359,7 @@ impl<T> Future for Recv<'_, T> {
             .clone();
         let mut state = inner.state.lock().unwrap();
         if let Some(item) = state.queue.pop_front() {
-            wake_one_sender(&mut state, false);
+            wake_one_sender(&mut state);
             return Poll::Ready(Some(item));
         }
         if state.senders == 0 {

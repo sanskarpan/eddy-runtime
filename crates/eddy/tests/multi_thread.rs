@@ -136,3 +136,110 @@ fn shutdown_timeout_drains_pending_tasks_promptly() {
     assert!(start.elapsed() < Duration::from_secs(2));
     assert!(dropped.load(Ordering::SeqCst));
 }
+
+#[test]
+fn task_routed_while_worker_is_parking_still_runs() {
+    // H1 regression: a task routed to a worker while it is between its final
+    // work re-check and claiming the driver holder must not be lost. The
+    // on_thread_park hook fires exactly in that window (after the re-check,
+    // before park_worker); routing a task while the hook holds the worker
+    // then lets it proceed must still result in the task running. The old
+    // code parked the worker in the kernel wait forever.
+    let entered_park = Arc::new(AtomicBool::new(false));
+    let release_park = Arc::new(AtomicBool::new(false));
+    let entered_for_hook = entered_park.clone();
+    let release_for_hook = release_park.clone();
+    let rt = Builder::new_multi_thread()
+        .worker_threads(1)
+        .on_thread_park(move || {
+            entered_for_hook.store(true, Ordering::Release);
+            while !release_for_hook.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+        })
+        .build();
+
+    while !entered_park.load(Ordering::Acquire) {
+        std::thread::yield_now();
+    }
+    let completed = Arc::new(AtomicBool::new(false));
+    let completed_for_task = completed.clone();
+    rt.spawn(async move {
+        completed_for_task.store(true, Ordering::Release);
+    });
+    release_park.store(true, Ordering::Release);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !completed.load(Ordering::Acquire) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "H1: task routed while the worker was parking never ran"
+        );
+        std::thread::yield_now();
+    }
+}
+
+#[test]
+fn block_in_place_handoff_stress() {
+    // H2 regression guard: repeated block_in_place handoffs between a worker
+    // and its takeover thread complete promptly. The deterministic H1 test
+    // covers the shared lost-wakeup window; this exercises the handoff under
+    // sustained cross-thread routing.
+    let rt = Builder::new_multi_thread().worker_threads(1).build();
+    let keep_busy = rt.spawn(async {
+        loop {
+            eddy::time::sleep(Duration::from_millis(1)).await;
+        }
+    });
+    let start = std::time::Instant::now();
+    let handoffs = rt.spawn(async {
+        let mut count = 0usize;
+        for _ in 0..200 {
+            eddy::Handle::current().block_in_place(async {
+                std::thread::yield_now();
+            });
+            count += 1;
+        }
+        count
+    });
+    assert_eq!(rt.block_on(async { handoffs.await.unwrap() }), 200);
+    assert!(start.elapsed() < Duration::from_secs(30));
+    drop(keep_busy);
+}
+
+#[test]
+fn block_in_place_panic_still_hands_back_the_queue() {
+    // M5 regression: a panicking `block_in_place` future must still hand the
+    // queue back to the takeover thread before the panic propagates, or the
+    // worker thread loses its identity and the takeover thread leaks.
+    let rt = Builder::new_multi_thread().worker_threads(1).build();
+    let boom = rt.spawn(async {
+        eddy::task::block_in_place(async { panic!("boom") });
+        0
+    });
+    let error = rt.block_on(async { boom.await.unwrap_err() });
+    assert!(matches!(error, eddy::task::JoinError::Panic(_)));
+    // The worker survived and still services tasks.
+    let n = rt.spawn(async { 40 + 2 });
+    assert_eq!(rt.block_on(async { n.await.unwrap() }), 42);
+    // A later block_in_place still hands off and completes promptly.
+    let handoff = rt.spawn(async {
+        eddy::task::block_in_place(async { std::thread::yield_now() });
+        7
+    });
+    assert_eq!(rt.block_on(async { handoff.await.unwrap() }), 7);
+}
+
+#[test]
+fn current_thread_runtime_is_not_send_or_sync() {
+    // H3 regression: a current-thread runtime must not be movable across
+    // threads (its shutdown polls and destroys `!Send` futures on the drop
+    // thread). This is enforced on `Runtime` itself; sharing happens through
+    // the `Handle`, which stays `Send + Sync`.
+    static_assertions::assert_not_impl_any!(eddy::Runtime: Send, Sync);
+}
+
+#[test]
+fn current_thread_handle_is_send_and_sync() {
+    static_assertions::assert_impl_all!(eddy::Handle: Send, Sync);
+}

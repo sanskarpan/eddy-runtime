@@ -1,4 +1,4 @@
-use std::future::pending;
+use std::future::{pending, Future};
 use std::time::{Duration, Instant};
 
 use eddy::time::{interval, sleep, timeout, Elapsed, MissedTickBehavior};
@@ -22,6 +22,29 @@ fn sleep_wakes_on_multi_thread_runtime() {
     let runtime = Builder::new_multi_thread().worker_threads(2).build();
     runtime.block_on(async {
         sleep(Duration::from_millis(10)).await;
+    });
+}
+
+#[test]
+fn sleep_reset_to_a_later_deadline_does_not_fire_early() {
+    // L1 regression: resetting an armed sleep to a later deadline must not
+    // leave the stale deadline armed in the wheel, or the wheel fires it
+    // early and the sleep resolves before its new deadline.
+    let runtime = Builder::new_current_thread().build();
+    runtime.block_on(async {
+        let sleeper = sleep(Duration::from_millis(60));
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        let mut pinned = std::pin::pin!(sleeper);
+        assert!(pinned.as_mut().poll(&mut cx).is_pending());
+        pinned
+            .as_mut()
+            .get_mut()
+            .reset(Instant::now() + Duration::from_secs(5));
+        assert!(pinned.as_mut().poll(&mut cx).is_pending());
+        // Wait well past the stale +60ms deadline: it must not fire.
+        sleep(Duration::from_millis(250)).await;
+        assert!(pinned.as_mut().poll(&mut cx).is_pending());
     });
 }
 

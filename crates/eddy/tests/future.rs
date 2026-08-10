@@ -1,11 +1,59 @@
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::task::{Context, RawWaker, RawWakerVTable, Waker};
 use std::time::{Duration, Instant};
 
 use eddy::future::{race, ready, select2, Either};
-use eddy::time::timeout_at;
+use eddy::time::{timeout, timeout_at};
 use eddy::{Builder, CancellationToken};
+
+struct WakerCounts {
+    clones: AtomicUsize,
+    wakes: AtomicUsize,
+    drops: AtomicUsize,
+}
+
+unsafe fn counting_clone(ptr: *const ()) -> RawWaker {
+    let counts = unsafe { Arc::from_raw(ptr as *const WakerCounts) };
+    let cloned = Arc::clone(&counts);
+    counts.clones.fetch_add(1, Ordering::SeqCst);
+    std::mem::forget(counts);
+    RawWaker::new(Arc::into_raw(cloned) as *const (), &COUNTING_VTABLE)
+}
+
+unsafe fn counting_wake(ptr: *const ()) {
+    let counts = unsafe { Arc::from_raw(ptr as *const WakerCounts) };
+    counts.wakes.fetch_add(1, Ordering::SeqCst);
+    std::mem::forget(counts);
+}
+
+unsafe fn counting_wake_ref(ptr: *const ()) {
+    let counts = unsafe { &*(ptr as *const WakerCounts) };
+    counts.wakes.fetch_add(1, Ordering::SeqCst);
+}
+
+unsafe fn counting_drop(ptr: *const ()) {
+    let counts = unsafe { Arc::from_raw(ptr as *const WakerCounts) };
+    counts.drops.fetch_add(1, Ordering::SeqCst);
+}
+
+static COUNTING_VTABLE: RawWakerVTable = RawWakerVTable::new(
+    counting_clone,
+    counting_wake,
+    counting_wake_ref,
+    counting_drop,
+);
+
+fn counting_waker(counts: Arc<WakerCounts>) -> Waker {
+    // SAFETY: `COUNTING_VTABLE` matches the `Arc<WakerCounts>` data pointer.
+    unsafe {
+        Waker::from_raw(RawWaker::new(
+            Arc::into_raw(counts) as *const (),
+            &COUNTING_VTABLE,
+        ))
+    }
+}
 
 #[test]
 fn join_and_try_join_complete_in_order() {
@@ -26,6 +74,33 @@ fn join_and_try_join_complete_in_order() {
             .await,
             Err("failed")
         );
+    });
+}
+
+#[test]
+fn try_join_three_short_circuits_on_error() {
+    let runtime = Builder::new_current_thread().build();
+    runtime.block_on(async {
+        // The middle future never completes: the macro must resolve to the
+        // fast error anyway. On the old code this awaited all three and hung.
+        let result = timeout(
+            Duration::from_millis(100),
+            eddy::try_join!(
+                async { Err::<i32, &'static str>("fast failure") },
+                std::future::pending::<Result<i32, &'static str>>(),
+                async { Ok::<_, &'static str>(0) },
+            ),
+        )
+        .await;
+        assert_eq!(result, Ok(Err("fast failure")));
+        // And the success path still yields all three outputs.
+        let joined = eddy::try_join!(
+            async { Ok::<i32, &'static str>(1) },
+            async { Ok::<i32, &'static str>(2) },
+            async { Ok::<i32, &'static str>(3) },
+        )
+        .await;
+        assert_eq!(joined, Ok((1, 2, 3)));
     });
 }
 
@@ -106,4 +181,58 @@ fn cancellation_token_propagates_to_children() {
         assert!(parent.is_cancelled());
         assert!(child.is_cancelled());
     });
+}
+
+#[test]
+fn cancelled_polling_does_not_leak_wakers() {
+    let token = CancellationToken::new();
+    let counts = Arc::new(WakerCounts {
+        clones: AtomicUsize::new(0),
+        wakes: AtomicUsize::new(0),
+        drops: AtomicUsize::new(0),
+    });
+    let waker = counting_waker(counts.clone());
+    let mut cx = Context::from_waker(&waker);
+    let mut fut = Box::pin(token.cancelled());
+    for _ in 0..100_000 {
+        assert!(fut.as_mut().poll(&mut cx).is_pending());
+    }
+    // Repeated polls with the same waker reuse the slot: a clone happens
+    // once at registration. The old code appended a waker per poll.
+    assert!(
+        counts.clones.load(Ordering::SeqCst) <= 2,
+        "each poll leaked a waker: {} clones",
+        counts.clones.load(Ordering::SeqCst)
+    );
+    token.cancel();
+    assert_eq!(
+        counts.wakes.load(Ordering::SeqCst),
+        1,
+        "cancel must wake exactly the live waiter"
+    );
+    drop(fut);
+}
+
+#[test]
+fn dropped_cancelled_future_is_not_woken() {
+    let token = CancellationToken::new();
+    let counts = Arc::new(WakerCounts {
+        clones: AtomicUsize::new(0),
+        wakes: AtomicUsize::new(0),
+        drops: AtomicUsize::new(0),
+    });
+    let waker = counting_waker(counts.clone());
+    let mut cx = Context::from_waker(&waker);
+    let mut first = Box::pin(token.cancelled());
+    let mut second = Box::pin(token.cancelled());
+    assert!(first.as_mut().poll(&mut cx).is_pending());
+    assert!(second.as_mut().poll(&mut cx).is_pending());
+    drop(first);
+    token.cancel();
+    assert_eq!(
+        counts.wakes.load(Ordering::SeqCst),
+        1,
+        "a dropped waiter must be unregistered before cancel"
+    );
+    assert!(second.as_mut().poll(&mut cx).is_ready());
 }

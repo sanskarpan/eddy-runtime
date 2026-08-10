@@ -25,7 +25,7 @@
 
 ---
 
-## Phase 1 — Task Representation (28 tasks)
+## Phase 1 — Task Representation (30 tasks)
 
 **Structure**
 - [ ] 🔴 `Header { state: AtomicUsize, vtable: &'static Vtable, owner_id: u32, queue_next: UnsafeCell<Option<NonNull<Header>>> }`
@@ -119,7 +119,7 @@
 
 ---
 
-## Phase 4 — Multi-Thread Scheduler (34 tasks)
+## Phase 4 — Multi-Thread Scheduler (37 tasks)
 
 **Chase-Lev deque**
 - [x] 🔴 `LOCAL_QUEUE_CAPACITY = 256`, fixed-size ring buffer
@@ -171,75 +171,75 @@
 ## Phase 5 — I/O Driver: Readiness (32 tasks)
 
 **Platform abstraction**
-- [ ] 🔴 `sys::Poller` trait: `new()`, `register(fd, token, interest)`, `reregister`, `deregister`, `wait(&mut events, timeout)`
-- [ ] 🔴 `Interest { READABLE, WRITABLE }`, `Ready` bitflags with `is_readable`, `is_writable`, `is_read_closed`, `is_write_closed`, `is_error`
-- [ ] 🔴 **Linux epoll**: `epoll_create1(EPOLL_CLOEXEC)`, `epoll_ctl`, `epoll_wait`
-- [ ] 🔴 **Level-triggered by default.** Edge-triggered requires draining to `EWOULDBLOCK` on every wake, and one missed drain is a permanent hang
-- [ ] 🔴 Edge-triggered behind a flag, with the drain requirement enforced in `AsyncRead`
-- [ ] 🔴 `EPOLLRDHUP` handling for half-close detection
-- [ ] 🟡 **macOS/BSD kqueue**: `kqueue()`, `kevent()` with `EVFILT_READ`/`EVFILT_WRITE`
-- [ ] 🟡 kqueue reports read and write as **separate events** — must be merged into one `Ready`
+- [x] 🔴 `sys::Poller` trait: `new()`, `register(fd, token, interest)`, `reregister`, `deregister`, `wait(&mut events, timeout)`
+- [x] 🔴 `Interest { READABLE, WRITABLE }`, `Ready` bitflags with `is_readable`, `is_writable`, `is_read_closed`, `is_write_closed`, `is_error`
+- [x] 🔴 **Linux epoll**: `epoll_create1(EPOLL_CLOEXEC)`, `epoll_ctl`, `epoll_wait`
+- [x] 🔴 **Level-triggered by default.** Edge-triggered requires draining to `EWOULDBLOCK` on every wake, and one missed drain is a permanent hang
+- [x] 🔴 Edge-triggered behind a flag, with the drain requirement enforced in `AsyncRead`
+- [x] 🔴 `EPOLLRDHUP` handling for half-close detection
+- [x] 🟡 **macOS/BSD kqueue**: `kqueue()`, `kevent()` with `EVFILT_READ`/`EVFILT_WRITE`
+- [x] 🟡 kqueue reports read and write as **separate events** — must be merged into one `Ready`
 - [ ] 🟡 **Windows IOCP**: `CreateIoCompletionPort`, `GetQueuedCompletionStatusEx`
 - [ ] 🟡 IOCP is completion-based; emulate readiness with zero-byte `WSARecv` (this is what mio does, and it's worth documenting why)
-- [ ] 🔴 **Waker fd**: `eventfd` (Linux) / `EVFILT_USER` (kqueue) / `PostQueuedCompletionStatus` (Windows) to interrupt a blocking wait
+- [x] 🔴 **Waker fd**: `eventfd` (Linux) / `EVFILT_USER` (kqueue) / `PostQueuedCompletionStatus` (Windows) to interrupt a blocking wait
 
 **Registration**
-- [ ] 🔴 `Slab<Arc<ScheduledIo>>` — **the slab index IS the epoll token**, giving O(1) event→registration with no hashing
-- [ ] 🔴 `ScheduledIo { readiness: AtomicUsize, waiters: Mutex<Waiters> }`
-- [ ] 🔴 **Packed readiness: `[generation : 32][readiness : 16][shutdown : 1]`**
-- [ ] 🔴 **Generation counter for fd reuse safety** — close fd 7, open a new socket that gets fd 7, and a stale in-flight event must be discarded
-- [ ] 🔴 `Waiters { reader: Option<Waker>, writer: Option<Waker>, list: LinkedList<Waiter> }`
-- [ ] 🔴 **Separate reader/writer wakers** — one socket can be read-waited and write-waited by different tasks; waking the wrong one is a hang
-- [ ] 🔴 `Registration::new(io, interest)` — set `O_NONBLOCK`, register with the poller
-- [ ] 🔴 `Registration::readiness(interest).await -> ReadyEvent`
-- [ ] 🔴 `ReadyEvent::clear_ready()` — **essential**: epoll can report spuriously, and without clearing and re-waiting the task spins
-- [ ] 🔴 `Registration::try_io(f)` — run a syscall, map `WouldBlock` to a readiness clear
-- [ ] 🔴 `Drop` deregisters and bumps the generation
+- [x] 🔴 `Slab<Arc<ScheduledIo>>` — **the slab index IS the epoll token**, giving O(1) event→registration with no hashing
+- [x] 🔴 `ScheduledIo { readiness: AtomicUsize, waiters: Mutex<Waiters> }`
+- [x] 🔴 **Packed readiness: `[generation : 32][readiness : 16][shutdown : 1]`**
+- [x] 🔴 **Generation counter for fd reuse safety** — close fd 7, open a new socket that gets fd 7, and a stale in-flight event must be discarded
+- [x] 🔴 `Waiters { reader: Option<Waker>, writer: Option<Waker>, list: LinkedList<Waiter> }`
+- [x] 🔴 **Separate reader/writer wakers** — one socket can be read-waited and write-waited by different tasks; waking the wrong one is a hang
+- [x] 🔴 `Registration::new(io, interest)` — set `O_NONBLOCK`, register with the poller
+- [x] 🔴 `Registration::readiness(interest).await -> ReadyEvent`
+- [x] 🔴 `ReadyEvent::clear_ready()` — **essential**: epoll can report spuriously, and without clearing and re-waiting the task spins
+- [x] 🔴 `Registration::try_io(f)` — run a syscall, map `WouldBlock` to a readiness clear
+- [x] 🔴 `Drop` deregisters and bumps the generation
 
 **Driver loop**
-- [ ] 🔴 `Driver::park(timeout)`: wait → dispatch events → wake tasks
-- [ ] 🔴 **The timeout comes from the timer wheel's next deadline** — this is the coupling point between I/O and time
-- [ ] 🔴 Timeout is `Duration::ZERO` if any task is ready, `None` if nothing is pending
-- [ ] 🔴 Dispatch: token → slab lookup → set readiness → take and wake the relevant wakers
-- [ ] 🔴 Driver runs on whichever worker parks first; others block on a condvar
-- [ ] 🔴 Test: register a socket, make it readable, assert the task is woken
-- [ ] 🔴 Test: 10,000 concurrent registrations, all woken correctly
-- [ ] 🔴 Test: fd reuse — close and reopen, assert no stale wake
-- [ ] 🔴 Test: reader and writer on one socket woken independently
-- [ ] 🔴 Test: spurious readiness → `clear_ready` → task re-waits without spinning
+- [x] 🔴 `Driver::park(timeout)`: wait → dispatch events → wake tasks
+- [x] 🔴 **The timeout comes from the timer wheel's next deadline** — this is the coupling point between I/O and time
+- [x] 🔴 Timeout is `Duration::ZERO` if any task is ready, `None` if nothing is pending
+- [x] 🔴 Dispatch: token → slab lookup → set readiness → take and wake the relevant wakers
+- [x] 🔴 Driver runs on whichever worker parks first; others block on a condvar
+- [x] 🔴 Test: register a socket, make it readable, assert the task is woken
+- [x] 🔴 Test: 10,000 concurrent registrations, all woken correctly
+- [x] 🔴 Test: fd reuse — close and reopen, assert no stale wake
+- [x] 🔴 Test: reader and writer on one socket woken independently
+- [x] 🔴 Test: spurious readiness → `clear_ready` → task re-waits without spinning
 
 ---
 
 ## Phase 6 — Timer Wheel (24 tasks)
 
-- [ ] 🔴 `Wheel { elapsed: u64, levels: Box<[Level; 6]>, pending: LinkedList<TimerEntry> }`
-- [ ] 🔴 `Level { occupied: u64, slots: [LinkedList<TimerEntry>; 64] }`
-- [ ] 🔴 **`occupied` bitmap so "next non-empty slot" is one `trailing_zeros()`** instead of scanning 64 lists
-- [ ] 🔴 64 slots per level makes indexing a shift+mask, not a division
-- [ ] 🔴 `level_for(when)`: XOR deadline with elapsed, find the highest differing bit, divide by 6
-- [ ] 🔴 `insert(entry)` — O(1)
-- [ ] 🔴 `remove(entry)` — O(1) via the intrusive list (no search)
-- [ ] 🔴 `next_expiration()` — scan levels for the earliest occupied slot
-- [ ] 🔴 `advance_to(now)` — fire level 0, **cascade** higher levels down when they wrap
-- [ ] 🔴 Cascading is amortized O(1): each timer moves down at most 6 times in its life
-- [ ] 🔴 `TimerEntry` with intrusive `Pointers`, deadline, waker, and a state atomic
-- [ ] 🔴 `TimerShared` state: `REGISTERED`, `PENDING`, `FIRED`, `CANCELLED`
-- [ ] 🔴 Timer driver integrated into `Driver::park` — the wheel's next deadline is the wait timeout
-- [ ] 🔴 `sleep(dur)` / `sleep_until(instant)` — `Sleep` future, resettable
-- [ ] 🔴 `Sleep::reset(new_deadline)` without reallocating — the entry is removed and reinserted
-- [ ] 🔴 `timeout(dur, fut)` — `Timeout` combinator returning `Result<T, Elapsed>`
-- [ ] 🔴 `interval(period)` with `MissedTickBehavior::{ Burst, Delay, Skip }`
+- [x] 🔴 `Wheel { elapsed: u64, levels: Box<[Level; 6]>, pending: LinkedList<TimerEntry> }`
+- [x] 🔴 `Level { occupied: u64, slots: [LinkedList<TimerEntry>; 64] }`
+- [x] 🔴 **`occupied` bitmap so "next non-empty slot" is one `trailing_zeros()`** instead of scanning 64 lists
+- [x] 🔴 64 slots per level makes indexing a shift+mask, not a division
+- [x] 🔴 `level_for(when)`: XOR deadline with elapsed, find the highest differing bit, divide by 6
+- [x] 🔴 `insert(entry)` — O(1)
+- [x] 🔴 `remove(entry)` — O(1) via the intrusive list (no search)
+- [x] 🔴 `next_expiration()` — scan levels for the earliest occupied slot
+- [x] 🔴 `advance_to(now)` — fire level 0, **cascade** higher levels down when they wrap
+- [x] 🔴 Cascading is amortized O(1): each timer moves down at most 6 times in its life
+- [x] 🔴 `TimerEntry` with intrusive `Pointers`, deadline, waker, and a state atomic
+- [x] 🔴 `TimerShared` state: `REGISTERED`, `PENDING`, `FIRED`, `CANCELLED`
+- [x] 🔴 Timer driver integrated into `Driver::park` — the wheel's next deadline is the wait timeout
+- [x] 🔴 `sleep(dur)` / `sleep_until(instant)` — `Sleep` future, resettable
+- [x] 🔴 `Sleep::reset(new_deadline)` without reallocating — the entry is removed and reinserted
+- [x] 🔴 `timeout(dur, fut)` — `Timeout` combinator returning `Result<T, Elapsed>`
+- [x] 🔴 `interval(period)` with `MissedTickBehavior::{ Burst, Delay, Skip }`
 - [ ] 🟡 `DelayQueue<T>` for expiring collections (connection reaping)
 - [ ] 🟡 Paused-time mode for tests: `time::pause()`, `time::advance(dur)`, auto-advance when all tasks are idle
-- [ ] 🔴 Test: 100k timers inserted and cancelled — **O(1) confirmed by timing, not just asymptotics**
-- [ ] 🔴 Test: timers fire in deadline order
-- [ ] 🔴 Test: timer never fires early; lateness bounded by one tick + scheduling latency
-- [ ] 🔴 Test: cascading across all 6 levels (a 2-year timer eventually reaches level 0)
-- [ ] 🔴 Test: `sleep` in 10k concurrent tasks all complete within tolerance
+- [x] 🔴 Test: 100k timers inserted and cancelled — **O(1) confirmed by timing, not just asymptotics**
+- [x] 🔴 Test: timers fire in deadline order
+- [x] 🔴 Test: timer never fires early; lateness bounded by one tick + scheduling latency
+- [x] 🔴 Test: cascading across all 6 levels (a 2-year timer eventually reaches level 0)
+- [x] 🔴 Test: `sleep` in 10k concurrent tasks all complete within tolerance
 
 ---
 
-## Phase 7 — Async I/O Types (26 tasks)
+## Phase 7 — Async I/O Types (27 tasks)
 
 **Traits**
 - [x] 🔴 `AsyncRead::poll_read(Pin<&mut Self>, &mut Context, &mut ReadBuf) -> Poll<io::Result<()>>`
@@ -280,7 +280,7 @@
 
 ---
 
-## Phase 8 — Synchronization Primitives (30 tasks)
+## Phase 8 — Synchronization Primitives (31 tasks)
 
 **Foundation**
 - [x] 🔴 `batch_semaphore`: the primitive underneath everything else. Intrusive FIFO waiter list, multi-permit acquire
@@ -514,7 +514,7 @@
 
 ---
 
-## Phase 17 — Correctness: loom, Miri, Differential (22 tasks)
+## Phase 17 — Correctness: loom, Miri, Differential (24 tasks)
 
 **loom** — *the* correctness tool for this project
 - [ ] 🔴 `sync` shim module re-exporting `loom::sync` under `--cfg loom`
@@ -576,14 +576,14 @@
 | Phase | Tasks |
 |---|---|
 | 0. Bootstrap | 14 |
-| 1. Task Representation | 28 |
+| 1. Task Representation | 30 |
 | 2. The Waker | 18 |
 | 3. Current-Thread Executor | 16 |
-| 4. Multi-Thread Scheduler | 34 |
+| 4. Multi-Thread Scheduler | 37 |
 | 5. I/O Driver (readiness) | 32 |
 | 6. Timer Wheel | 24 |
-| 7. Async I/O Types | 26 |
-| 8. Sync Primitives | 30 |
+| 7. Async I/O Types | 27 |
+| 8. Sync Primitives | 31 |
 | 9. Combinators & Cancellation | 18 |
 | 10. Blocking Pool | 14 |
 | 11. Cooperative Budget | 12 |
@@ -592,6 +592,6 @@
 | 14. TUI Console | 16 |
 | 15. Web Console | 28 |
 | 16. Macros | 10 |
-| 17. loom / Miri / Differential | 22 |
+| 17. loom / Miri / Differential | 24 |
 | 18. Benchmarks & Polish | 16 |
-| **TOTAL** | **396** |
+| **TOTAL** | **405** |

@@ -27,9 +27,15 @@ impl Sleep {
     }
 
     /// Change the deadline without allocating a new timer entry.
+    ///
+    /// If the entry is still armed in the wheel with the old deadline, cancel
+    /// it first so the wheel cannot fire at the stale time.
     pub fn reset(&mut self, deadline: Instant) {
         self.deadline = deadline;
         self.entry.reset();
+        if let Some(driver) = &self.driver {
+            driver.cancel(&self.entry);
+        }
     }
 }
 

@@ -91,6 +91,13 @@ impl Level {
 
 /// Hierarchical hashed timing wheel. `elapsed` is milliseconds since the
 /// associated `TimerShared` was created.
+///
+/// Time is bucketed per level, so a timer lands in the slot of its rounded
+/// bucket and can fire up to ~1 ms before its true deadline (L7): when
+/// `insert`'s slot arithmetic rounds `when` down, `advance_to` reaches the
+/// slot's representative instant one millisecond early. This is an accepted
+/// tradeoff of a low-resolution wheel — timers never fire late, only early
+/// within the wheel's granularity.
 pub(crate) struct Wheel {
     pub(crate) elapsed: u64,
     levels: Box<[Level; LEVEL_COUNT]>,
