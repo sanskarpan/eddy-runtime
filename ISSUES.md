@@ -393,8 +393,14 @@ completes (must hang on current code).
 - **mpsc cancel-recv test was vacuous** (`tests/sync.rs:111-116`): **fixed** —
   replaced with a real pending-recv drop: poll a `Box::pin(receiver.recv())`
   with a noop waker, drop it, then send → the item is still delivered.
-- **fd-reuse test** (`tests/io.rs`): as written the stale event can never
-  exist; needs a driver-generated stale event to be meaningful. Still open.
+- **fd-reuse test** (`tests/io.rs`): **fixed** — the test now arms a genuine
+  stale event: it makes the old registration readable and waits for the
+  driver to record readiness, then frees the slab slot and reuses it (same
+  index, newer generation), asserting the new registration is not woken and
+  still delivers its own events. The dispatch-time generation guard
+  (`driver.rs:599`) covers the remaining in-flight-race window, which is not
+  deterministically constructible from user space (the kernel drops interest
+  on close, so a stale event can never survive a swap at the poller level).
 - **steal-count assertion** (`worker.rs:992-995`): **fixed** — the stress test
   now alternates fast/slow tasks (10× `yield_now` every other task) so the
   steal is deterministic, and it asserts completion + steal count.
