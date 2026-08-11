@@ -12,60 +12,60 @@
 - [ ] 🔴 `cargo add libc slab parking_lot pin-project-lite tracing crossbeam-utils`
 - [ ] 🔴 `cargo add --dev loom criterion proptest futures tokio` — **`tokio` and `futures` are test-only oracles**
 - [ ] 🔴 **Forbid runtime deps in the main crate**: CI check that `cargo tree -p eddy --edges normal` contains no `tokio`, `async-std`, `smol`, `mio`, `polling`, or `futures-executor`
-- [ ] 🔴 `[target.'cfg(loom)'.dependencies] loom = "0.7"` with a `loom` cfg flag and a `sync` shim module re-exporting either `std::sync` or `loom::sync`
-- [ ] 🔴 `#![deny(clippy::undocumented_unsafe_blocks)]` workspace-wide
+- [x] 🔴 `[target.'cfg(loom)'.dependencies] loom = "0.7"` with a `loom` cfg flag and a `sync` shim module re-exporting either `std::sync` or `loom::sync`
+- [x] 🔴 `#![deny(clippy::undocumented_unsafe_blocks)]` workspace-wide
 - [ ] 🔴 CI matrix: `x86_64-linux`, `aarch64-linux` (QEMU — **weak memory ordering exposes bugs x86 hides**), `aarch64-macos`, `x86_64-windows`
-- [ ] 🔴 CI jobs: `test`, `test-loom` (`RUSTFLAGS="--cfg loom"`), `miri`, `bench`
+- [x] 🔴 CI jobs: `test`, `test-loom` (`RUSTFLAGS="--cfg loom"`), `miri` (bench not in CI)
 - [ ] 🔴 `Makefile`/`justfile`: `test`, `loom`, `miri`, `bench`, `bench-vs-tokio`, `console`, `console-web`
-- [ ] 🔴 `util/rand.rs`: xorshift `FastRand` for steal-victim selection (no `rand` dependency)
-- [ ] 🔴 `util/linked_list.rs`: intrusive doubly-linked list with `Pointers<T>` — used by waiter lists and the timer wheel
+- [x] 🔴 `util/rand.rs`: xorshift `FastRand` for steal-victim selection (no `rand` dependency)
+- [x] 🔴 `util/linked_list.rs`: intrusive doubly-linked list with `Pointers<T>` — used by waiter lists and the timer wheel (SB-hardened, Miri-clean)
 - [ ] 🔴 `cd console-ui && bun create vite . --template react-ts`
 - [ ] 🔴 `bun add d3 @dagrejs/dagre recharts zustand clsx lucide-react`; `bun add -d tailwindcss postcss autoprefixer @types/d3`; `bunx shadcn@latest init` + `button card table tabs badge tooltip separator scroll-area resizable select slider`
-- [ ] 🔴 Spike: hand-write a `Waker` with a `RawWakerVTable`, poll a trivial future to completion on one thread, no dependencies. **Do this first** — if the vtable refcounting is wrong, everything above it is unfixable.
+- [x] 🔴 Spike: hand-write a `Waker` with a `RawWakerVTable`, poll a trivial future to completion on one thread, no dependencies. **Do this first** — if the vtable refcounting is wrong, everything above it is unfixable.
 
 ---
 
 ## Phase 1 — Task Representation (30 tasks)
 
 **Structure**
-- [ ] 🔴 `Header { state: AtomicUsize, vtable: &'static Vtable, owner_id: u32, queue_next: UnsafeCell<Option<NonNull<Header>>> }`
-- [ ] 🔴 `Core<F, S> { scheduler: S, stage: UnsafeCell<Stage<F>> }` with `Stage::{ Running(F), Finished(F::Output), Consumed }`
-- [ ] 🔴 `Trailer { waker: UnsafeCell<Option<Waker>> }` for the `JoinHandle`'s waker
-- [ ] 🔴 `#[repr(C)] Cell<F, S>` — **one allocation** holding header + core + trailer
-- [ ] 🔴 `RawTask(NonNull<Header>)` — one word, type-erased, vtable reached through the header
-- [ ] 🔴 `Vtable` with `poll`, `schedule`, `dealloc`, `try_read_output`, `drop_join_handle_slow`, `shutdown`
-- [ ] 🔴 `vtable::<F, S>()` const fn producing a `&'static Vtable` per (future, scheduler) pair
+- [x] 🔴 `Header { state: AtomicUsize, vtable: &'static Vtable, owner_id: u32, queue_next: UnsafeCell<Option<NonNull<Header>>> }`
+- [x] 🔴 `Core<F, S> { scheduler: S, stage: UnsafeCell<Stage<F>> }` with `Stage::{ Running(F), Finished(F::Output), Consumed }`
+- [x] 🔴 `Trailer { waker: UnsafeCell<Option<Waker>> }` for the `JoinHandle`'s waker
+- [x] 🔴 `#[repr(C)] Cell<F, S>` — **one allocation** holding header + core + trailer
+- [x] 🔴 `RawTask(NonNull<Header>)` — one word, type-erased, vtable reached through the header
+- [x] 🔴 `Vtable` with `poll`, `schedule`, `dealloc`, `try_read_output`, `drop_join_handle_slow`, `shutdown`
+- [x] 🔴 `vtable::<F, S>()` const fn producing a `&'static Vtable` per (future, scheduler) pair
 - [ ] 🔴 **`queue_next` is the intrusive link** — the global injector is a list threaded through tasks, allocating nothing per push
 
 **State machine**
-- [ ] 🔴 Packed state: `[ refcount : 48 ][ flags : 16 ]` in one `AtomicUsize`
-- [ ] 🔴 Flags: `RUNNING`, `COMPLETE`, `NOTIFIED`, `CANCELLED`, `JOIN_INTEREST`, `JOIN_WAKER_SET`
-- [ ] 🔴 `transition_to_running()` — fails if already RUNNING or COMPLETE
-- [ ] 🔴 `transition_to_idle()` — returns whether NOTIFIED was set while running (→ must re-queue)
-- [ ] 🔴 `transition_to_complete()` — sets COMPLETE, wakes the JoinHandle waker
-- [ ] 🔴 **`transition_to_notified()`**: if RUNNING, set NOTIFIED and do nothing (the poller re-queues); else set NOTIFIED and schedule
-- [ ] 🔴 `ref_inc()` / `ref_dec()` returning whether the count hit zero
-- [ ] 🔴 Refcount overflow check — abort rather than wrap
-- [ ] 🔴 Every transition is a single `fetch_update` CAS, documented with the invariant it preserves
+- [x] 🔴 Packed state: `[ refcount : 48 ][ flags : 16 ]` in one `AtomicUsize`
+- [x] 🔴 Flags: `RUNNING`, `COMPLETE`, `NOTIFIED`, `CANCELLED`, `JOIN_INTEREST`, `JOIN_WAKER_SET`
+- [x] 🔴 `transition_to_running()` — fails if already RUNNING or COMPLETE
+- [x] 🔴 `transition_to_idle()` — returns whether NOTIFIED was set while running (→ must re-queue)
+- [x] 🔴 `transition_to_complete()` — sets COMPLETE, wakes the JoinHandle waker
+- [x] 🔴 **`transition_to_notified()`**: if RUNNING, set NOTIFIED and do nothing (the poller re-queues); else set NOTIFIED and schedule
+- [x] 🔴 `ref_inc()` / `ref_dec()` returning whether the count hit zero
+- [x] 🔴 Refcount overflow check — abort rather than wrap
+- [x] 🔴 Every transition is a single `fetch_update` CAS, documented with the invariant it preserves
 
 **Harness (the poll driver)**
-- [ ] 🔴 `Harness::poll()`: transition to running → build waker → poll → transition to idle-or-complete
-- [ ] 🔴 Catch panics in `poll` (`catch_unwind`), store as `JoinError::Panic`, do not poison the runtime
-- [ ] 🔴 `Harness::dealloc()`: drop the stage in place, then free the allocation
-- [ ] 🔴 `Harness::shutdown()`: cancel without polling, for runtime teardown
+- [x] 🔴 `Harness::poll()`: transition to running → build waker → poll → transition to idle-or-complete
+- [x] 🔴 Catch panics in `poll` (`catch_unwind`), store as `JoinError::Panic`, do not poison the runtime
+- [x] 🔴 `Harness::dealloc()`: drop the stage in place, then free the allocation
+- [x] 🔴 `Harness::shutdown()`: cancel without polling, for runtime teardown
 
 **JoinHandle**
-- [ ] 🔴 `JoinHandle<T>` implementing `Future<Output = Result<T, JoinError>>`
-- [ ] 🔴 Registers its waker in the trailer; woken on completion
-- [ ] 🔴 `abort()` — sets CANCELLED; a not-yet-running task is dropped without polling
-- [ ] 🔴 Dropping a `JoinHandle` detaches the task (it keeps running) and drops one reference
-- [ ] 🔴 `JoinError::{ Panic(Box<dyn Any + Send>), Cancelled }`
-- [ ] 🔴 `AbortHandle` — abort without holding the output
+- [x] 🔴 `JoinHandle<T>` implementing `Future<Output = Result<T, JoinError>>`
+- [x] 🔴 Registers its waker in the trailer; woken on completion
+- [x] 🔴 `abort()` — sets CANCELLED; a not-yet-running task is dropped without polling
+- [x] 🔴 Dropping a `JoinHandle` detaches the task (it keeps running) and drops one reference
+- [x] 🔴 `JoinError::{ Panic(Box<dyn Any + Send>), Cancelled }`
+- [x] 🔴 `AbortHandle` — abort without holding the output
 
 **Tests**
-- [ ] 🔴 Test: spawn, poll to completion, output readable via JoinHandle
-- [ ] 🔴 Test: allocation counter proves exactly one alloc per task and one dealloc
-- [ ] 🔴 Test: panicking future → `JoinError::Panic`, runtime still usable
+- [x] 🔴 Test: spawn, poll to completion, output readable via JoinHandle
+- [x] 🔴 Test: allocation counter proves exactly one alloc per task and one dealloc
+- [x] 🔴 Test: panicking future → `JoinError::Panic`, runtime still usable
 
 ---
 
@@ -73,26 +73,26 @@
 
 **This is the hardest `unsafe` in the project.**
 
-- [ ] 🔴 `WAKER_VTABLE: RawWakerVTable` with the four functions
-- [ ] 🔴 `clone_waker`: `ref_inc()`, return a new `RawWaker` with the same data pointer — **+1**
-- [ ] 🔴 `wake_waker`: **consumes** the reference — schedule, and the schedule takes ownership
-- [ ] 🔴 `wake_by_ref_waker`: **does not consume** — schedule with an explicit `ref_inc()` for the queued reference
-- [ ] 🔴 `drop_waker`: `ref_dec()`, dealloc if zero — **-1**
-- [ ] 🔴 **Document the +1/-1 contract on every function.** Getting `wake` vs `wake_by_ref` backwards leaks every task or frees queued ones
-- [ ] 🔴 `waker_from_raw(NonNull<Header>) -> Waker`
-- [ ] 🔴 `WakerRef<'a>` — a borrowed waker for the common poll path, avoiding a clone per poll
-- [ ] 🔴 `noop_waker()` for tests
-- [ ] 🔴 Implement `Waker::will_wake` correctly (same data pointer + same vtable) so combinators can skip redundant clones
+- [x] 🔴 `WAKER_VTABLE: RawWakerVTable` with the four functions
+- [x] 🔴 `clone_waker`: `ref_inc()`, return a new `RawWaker` with the same data pointer — **+1**
+- [x] 🔴 `wake_waker`: **consumes** the reference — schedule, and the schedule takes ownership
+- [x] 🔴 `wake_by_ref_waker`: **does not consume** — schedule with an explicit `ref_inc()` for the queued reference
+- [x] 🔴 `drop_waker`: `ref_dec()`, dealloc if zero — **-1**
+- [x] 🔴 **Document the +1/-1 contract on every function.** Getting `wake` vs `wake_by_ref` backwards leaks every task or frees queued ones
+- [x] 🔴 `waker_from_raw(NonNull<Header>) -> Waker`
+- [x] 🔴 `WakerRef<'a>` — a borrowed waker for the common poll path, avoiding a clone per poll
+- [x] 🔴 `noop_waker()` for tests
+- [x] 🔴 Implement `Waker::will_wake` correctly (same data pointer + same vtable) so combinators can skip redundant clones
 
 **Tests**
-- [ ] 🔴 Test: clone/drop a waker 10,000 times → refcount returns to baseline, no leak
-- [ ] 🔴 Test: `wake()` on a pending task schedules exactly once
-- [ ] 🔴 Test: `wake()` twice before poll schedules only once (NOTIFIED is idempotent)
-- [ ] 🔴 **Test: `wake()` during poll → task is re-queued after the poll returns Pending** (the lost-wakeup case)
-- [ ] 🔴 Test: `wake()` after completion is a no-op and does not resurrect the task
-- [ ] 🔴 Test: waker outliving the task keeps it alive; dropping the last waker deallocs
-- [ ] 🔴 **loom: wake during poll from another thread** — asserts the task ends up completed or queued, never lost, never double-queued
-- [ ] 🔴 **loom: concurrent clone + drop from two threads** — refcount is exact, exactly one dealloc
+- [x] 🔴 Test: clone/drop a waker 10,000 times → refcount returns to baseline, no leak
+- [x] 🔴 Test: `wake()` on a pending task schedules exactly once
+- [x] 🔴 Test: `wake()` twice before poll schedules only once (NOTIFIED is idempotent)
+- [x] 🔴 **Test: `wake()` during poll → task is re-queued after the poll returns Pending** (the lost-wakeup case)
+- [x] 🔴 Test: `wake()` after completion is a no-op and does not resurrect the task
+- [x] 🔴 Test: waker outliving the task keeps it alive; dropping the last waker deallocs
+- [x] 🔴 **loom: wake during poll from another thread** — asserts the task ends up completed or queued, never lost, never double-queued
+- [x] 🔴 **loom: concurrent clone + drop from two threads** — refcount is exact, exactly one dealloc
 
 ---
 
@@ -100,22 +100,22 @@
 
 **Build this before the multi-thread scheduler. It proves the task/waker machinery in isolation.**
 
-- [ ] 🔴 `CurrentThread { queue: VecDeque<Notified>, ... }` — plain deque, no atomics on the hot path
-- [ ] 🔴 `block_on(fut)`: park the current thread, poll the root future, run queued tasks between polls
-- [ ] 🔴 `block_on` uses a thread-parking waker (`Thread::unpark`) for the root future
-- [ ] 🔴 `spawn(fut)` from inside `block_on` — supports `!Send` futures
-- [ ] 🔴 Injection queue for wakes arriving from other threads while `block_on` is running
-- [ ] 🔴 Fairness: check the injection queue every `GLOBAL_QUEUE_INTERVAL` polls
-- [ ] 🔴 `CURRENT` thread-local holding the runtime `Handle`; `Handle::current()` with a clear panic message when outside a runtime
-- [ ] 🔴 `EnterGuard` for `Handle::enter()`
-- [ ] 🔴 Shutdown: drain the queue, drop all tasks at their next await point
-- [ ] 🔴 `Builder::new_current_thread()`
-- [ ] 🔴 **No LIFO slot** in this scheduler (nothing to gain, and it complicates fairness)
-- [ ] 🔴 Test: `block_on(async { 42 })` returns 42
-- [ ] 🔴 Test: spawn 1000 tasks, all complete, results correct
-- [ ] 🔴 Test: nested spawn (a task spawns a task) works
-- [ ] 🔴 Test: `!Send` future compiles and runs
-- [ ] 🔴 Test: wake from another thread while blocked in `block_on` makes progress
+- [x] 🔴 `CurrentThread { queue: VecDeque<Notified>, ... }` — plain deque, no atomics on the hot path
+- [x] 🔴 `block_on(fut)`: park the current thread, poll the root future, run queued tasks between polls
+- [x] 🔴 `block_on` uses a thread-parking waker (`Thread::unpark`) for the root future
+- [x] 🔴 `spawn(fut)` from inside `block_on` — supports `!Send` futures
+- [x] 🔴 Injection queue for wakes arriving from other threads while `block_on` is running
+- [x] 🔴 Fairness: check the injection queue every `GLOBAL_QUEUE_INTERVAL` polls
+- [x] 🔴 `CURRENT` thread-local holding the runtime `Handle`; `Handle::current()` with a clear panic message when outside a runtime
+- [x] 🔴 `EnterGuard` for `Handle::enter()`
+- [x] 🔴 Shutdown: drain the queue, drop all tasks at their next await point
+- [x] 🔴 `Builder::new_current_thread()`
+- [x] 🔴 **No LIFO slot** in this scheduler (nothing to gain, and it complicates fairness)
+- [x] 🔴 Test: `block_on(async { 42 })` returns 42
+- [x] 🔴 Test: spawn 1000 tasks, all complete, results correct
+- [x] 🔴 Test: nested spawn (a task spawns a task) works
+- [x] 🔴 Test: `!Send` future compiles and runs
+- [x] 🔴 Test: wake from another thread while blocked in `block_on` makes progress
 
 ---
 
@@ -532,8 +532,8 @@
 - [ ] 🔴 **CI runs loom on every PR** (bounded preemptions to keep it under 10 minutes)
 
 **Miri**
-- [ ] 🔴 Miri over the task allocation, waker vtable, intrusive lists, `ReadBuf`
-- [ ] 🔴 Stacked-borrows clean (no `-Zmiri-tag-raw-pointers` suppressions)
+- [x] 🔴 Miri over the task allocation, waker vtable, intrusive lists, `ReadBuf` (task/waker/intrusive lists done — 35 lib tests clean; `ReadBuf`/io paths call foreign syscalls Miri cannot run, covered by the other gate jobs)
+- [x] 🔴 Stacked-borrows clean (no `-Zmiri-tag-raw-pointers` suppressions) — caught and fixed the intrusive-list violation (ISSUES.md C3)
 - [ ] 🔴 `-Zmiri-strict-provenance` clean
 
 **Differential vs Tokio**

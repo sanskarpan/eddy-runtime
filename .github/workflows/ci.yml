@@ -38,3 +38,19 @@ jobs:
         env:
           RUSTFLAGS: "--cfg loom"
         run: cargo test -p eddy --lib
+
+  miri:
+    # Stacked-borrows/UB check for the pure modules. Tests that construct a
+    # runtime call foreign syscalls (kqueue/epoll) Miri cannot run, so they are
+    # filtered out; the checked modules are disjoint from `runtime::tests`:
+    # `time::` would match "runtime::", but `time::wheel::` does not.
+    name: miri
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+      - name: Miri
+        run: 'cargo miri test -p eddy --lib -- task:: sync:: time::wheel::'

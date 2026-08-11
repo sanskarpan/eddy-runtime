@@ -27,10 +27,6 @@ impl Linked for Waiter {
     fn pointers(&self) -> &Pointers<Self> {
         &self.links
     }
-
-    fn pointers_mut(&mut self) -> &mut Pointers<Self> {
-        &mut self.links
-    }
 }
 
 // SAFETY: Waiter is accessed only while the semaphore state mutex is held.

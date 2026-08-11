@@ -52,10 +52,6 @@ impl Linked for TimerEntry {
     fn pointers(&self) -> &Pointers<Self> {
         &self.links
     }
-
-    fn pointers_mut(&mut self) -> &mut Pointers<Self> {
-        &mut self.links
-    }
 }
 
 // SAFETY: links are accessed only while the owning TimerShared wheel mutex is
@@ -65,7 +61,10 @@ unsafe impl Send for TimerEntry {}
 unsafe impl Sync for TimerEntry {}
 
 fn into_raw(entry: Arc<TimerEntry>) -> std::ptr::NonNull<TimerEntry> {
-    let ptr = std::ptr::NonNull::from(Arc::as_ref(&entry));
+    // SAFETY: the Arc is leaked here and only restored by `from_raw`, so the
+    // allocation outlives every list access. `Arc::as_ptr` performs no retag,
+    // keeping the node's interior links writable through shared references.
+    let ptr = unsafe { std::ptr::NonNull::new_unchecked(Arc::as_ptr(&entry).cast_mut()) };
     std::mem::forget(entry);
     ptr
 }
@@ -149,7 +148,9 @@ impl Wheel {
 
         let level = entry.level.load(Ordering::Acquire);
         let slot = entry.slot.load(Ordering::Acquire) as usize;
-        let ptr = std::ptr::NonNull::from(Arc::as_ref(entry));
+        // SAFETY: `entry` is a live Arc and `Arc::as_ptr` performs no retag,
+        // so the node's interior links stay writable (see `into_raw`).
+        let ptr = unsafe { std::ptr::NonNull::new_unchecked(Arc::as_ptr(entry).cast_mut()) };
         if level == PENDING_LEVEL {
             // SAFETY: the entry is linked in the pending list.
             unsafe { self.pending.remove(ptr) };

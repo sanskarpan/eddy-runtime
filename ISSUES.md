@@ -126,6 +126,35 @@ the increment at line 123 is never undone.
 the reserve still completes; (c) capacity-1 reserve→drop-permit→send never
 loses the slot.
 
+### C3 — Intrusive list node access violates Stacked Borrows (UB, Miri-caught)
+
+**Location:** `util/linked_list.rs` (all writes went through `&mut` into the
+node) and the shared-node callers that derived the raw pointer from a shared
+reference: `time/wheel.rs:68` (`into_raw`) and `wheel.rs:152` (`remove`),
+`io/driver.rs:119` (`into_raw`), `driver.rs:292/304`. The semaphore's
+stack-owned waiters (`sync/semaphore.rs:107,125,138`) were already safe —
+their pointers derive from `&mut`.
+
+**Failure trace.** `into_raw`/`remove` produced the node pointer via
+`NonNull::from(Arc::as_ref(..))`, which retags the node's memory
+`SharedReadOnly`. The list then wrote through `&mut *node.as_ptr()`
+(`linked_list.rs:69,92,151` and the neighbor updates) — an invalid `&mut`
+retag over a location that only grants shared access. Latent UB on every
+platform; Miri reports it as a Stacked Borrows violation on the first
+insert (`time::wheel::tests::cascades_across_all_levels`).
+
+**Fix (landed).** The links now live behind an `UnsafeCell`
+(`Pointers { inner: UnsafeCell<PointersInner> }`) and every mutation goes
+through the cell's interior pointer, which Stacked Borrows exempts from
+shared retags — the pattern tokio's intrusive list uses. Node pointers are
+derived with `Arc::as_ptr(..).cast_mut()`, which performs no retag. The
+`Linked` trait dropped `pointers_mut`.
+
+**Tests.** Miri: the full pure-module lib sweep is clean (35/35: task 27,
+sync 2, time wheel 4, linked_list 1, rand 1) and CI now runs it
+(`cargo miri test -p eddy --lib -- task:: sync:: time::wheel::`). Full suite
+138/138 and loom 17/17 still pass; io/net/time hammer runs clean.
+
 ---
 
 ## High

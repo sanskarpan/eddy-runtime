@@ -62,10 +62,6 @@ impl Linked for Waiter {
     fn pointers(&self) -> &Pointers<Self> {
         &self.links
     }
-
-    fn pointers_mut(&mut self) -> &mut Pointers<Self> {
-        &mut self.links
-    }
 }
 
 fn interest_satisfied(interest: Interest, ready: Ready) -> bool {
@@ -114,9 +110,16 @@ unsafe impl Send for ScheduledIo {}
 // Mutex-serialized accesses.
 unsafe impl Sync for ScheduledIo {}
 
+/// Raw pointer to a live waiter, without retagging its interior links.
+fn as_raw(waiter: &Arc<Waiter>) -> NonNull<Waiter> {
+    // SAFETY: the caller keeps the `Arc` alive and uses the pointer only
+    // while holding the waiters lock; `Arc::as_ptr` performs no retag.
+    unsafe { NonNull::new_unchecked(Arc::as_ptr(waiter).cast_mut()) }
+}
+
 /// Leak one Arc reference into a raw pointer owned by a slot or the list.
 fn into_raw(waiter: Arc<Waiter>) -> NonNull<Waiter> {
-    let ptr = NonNull::from(Arc::as_ref(&waiter));
+    let ptr = as_raw(&waiter);
     std::mem::forget(waiter);
     ptr
 }
@@ -289,7 +292,7 @@ impl ScheduledIo {
             Slot::Writer => &mut waiters.writer,
         };
         if let Some(registered) = entry {
-            if *registered == NonNull::from(Arc::as_ref(waiter)) {
+            if *registered == as_raw(waiter) {
                 // SAFETY: `registered` is the leaked reference the slot
                 // owns; dropping it returns our own reference.
                 unsafe { std::mem::drop(from_raw(*registered)) };
@@ -301,7 +304,7 @@ impl ScheduledIo {
     fn remove_list_waiter(&self, waiter: &Arc<Waiter>) {
         let mut waiters = self.waiters.lock().unwrap();
         if waiter.links.is_linked() {
-            let ptr = NonNull::from(Arc::as_ref(waiter));
+            let ptr = as_raw(waiter);
             // SAFETY: `waiter` is a live node linked in this list; removing
             // restores the list's reference, which we drop right away.
             unsafe { waiters.list.remove(ptr) };
