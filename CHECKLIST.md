@@ -369,18 +369,18 @@
 
 ## Phase 11 — Cooperative Budget & Fairness (12 tasks)
 
-- [ ] 🔴 `coop::Budget(Option<u8>)` in a thread-local, `BUDGET = 128`
-- [ ] 🔴 `poll_proceed(cx)` — decrement; when exhausted, `wake_by_ref()` and return Pending
-- [ ] 🔴 Budget reset at the start of each task poll
-- [ ] 🔴 **Every resource operation consumes budget**: channel recv, mutex lock, semaphore acquire, I/O readiness
-- [ ] 🔴 `unconstrained(fut)` to opt out
-- [ ] 🔴 `block_on` runs unconstrained
-- [ ] 🔴 `yield_now()` — explicit cooperation point
-- [ ] 🔴 `has_budget_remaining()` for library authors
-- [ ] 🔴 **Test: `loop { rx.recv().await }` on an always-ready channel does not starve other tasks** — this is the canonical failure the budget exists to prevent
-- [ ] 🔴 Test: budget exhaustion forces a yield after exactly 128 ops
-- [ ] 🔴 Test: `unconstrained` genuinely bypasses it
-- [ ] 🟡 Emit a `BudgetExhausted` event for the console
+- [x] 🔴 `coop::Budget(Option<u8>)` in a thread-local, `BUDGET = 128`
+- [x] 🔴 `poll_proceed(cx)` — decrement; when exhausted, `wake_by_ref()` and return Pending
+- [x] 🔴 Budget reset at the start of each task poll
+- [x] 🔴 **Every resource operation consumes budget**: channel recv, mutex lock, semaphore acquire, I/O readiness
+- [x] 🔴 `unconstrained(fut)` to opt out
+- [x] 🔴 `block_on` runs unconstrained
+- [x] 🔴 `yield_now()` — explicit cooperation point
+- [x] 🔴 `has_budget_remaining()` for library authors
+- [x] 🔴 **Test: `loop { rx.recv().await }` on an always-ready channel does not starve other tasks** — this is the canonical failure the budget exists to prevent
+- [x] 🔴 Test: budget exhaustion forces a yield after exactly 128 ops
+- [x] 🔴 Test: `unconstrained` genuinely bypasses it
+- [x] 🟡 Emit a `BudgetExhausted` event for the console
 
 ---
 

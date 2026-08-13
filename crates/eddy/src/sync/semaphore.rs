@@ -88,6 +88,11 @@ impl Future for Acquire<'_> {
     type Output = Result<SemaphorePermit, AcquireError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // Cooperative scheduling: an acquire that succeeds immediately (or
+        // the hot loop polling it) must yield once its budget is spent.
+        if crate::coop::poll_proceed(cx).is_pending() {
+            return Poll::Pending;
+        }
         // SAFETY: polling does not move the pinned future allocation.
         let this = unsafe { self.get_unchecked_mut() };
         let mut state = this.inner.state.lock().unwrap();

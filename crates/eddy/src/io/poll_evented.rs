@@ -79,6 +79,9 @@ impl<E: AsRawFd> PollEvented<E> {
     }
 
     fn poll_read_inner(&self, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        if crate::coop::poll_proceed(cx).is_pending() {
+            return Poll::Pending;
+        }
         let mut waiter = self.read_waiter.lock().unwrap();
         loop {
             let event =
@@ -109,6 +112,9 @@ impl<E: AsRawFd> PollEvented<E> {
     fn poll_write_inner(&self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
+        }
+        if crate::coop::poll_proceed(cx).is_pending() {
+            return Poll::Pending;
         }
         let mut waiter = self.write_waiter.lock().unwrap();
         loop {

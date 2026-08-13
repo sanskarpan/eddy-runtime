@@ -65,6 +65,7 @@ pub(super) unsafe fn poll<F: Future, S: Schedule>(header: NonNull<Header>) {
                 // never moved for the lifetime of the allocation (the `Cell`
                 // is heap-allocated once and never relocated).
                 let pin = Pin::new_unchecked(fut);
+                let _budget = crate::coop::budget_guard();
                 catch_unwind(AssertUnwindSafe(|| pin.poll(&mut cx)))
             }
             _ => unreachable!("eddy: poll called on a task not in Running stage"),
