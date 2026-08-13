@@ -190,6 +190,23 @@ impl CurrentThread {
                 Some(task) => task.run(),
                 None => {
                     self.0.timer.advance_to_now();
+                    // H4: `advance_to_now` may have just fired a timer whose
+                    // waker belongs to a *spawned* task. Waking it enqueues
+                    // the task on this thread without unparking (the
+                    // owner-thread enqueue fast path), so parking here —
+                    // bounded or not — would strand that work. Re-check the
+                    // queues and loop instead of sleeping.
+                    if !self.0.deferred.lock().unwrap().is_empty()
+                        || !self.0.local.lock().unwrap().is_empty()
+                        || !self.0.injection.lock().unwrap().is_empty()
+                    {
+                        continue;
+                    }
+                    // Paused time: the scheduler never blocks; the clock is
+                    // advanced to the next timer deadline instead.
+                    if self.0.timer.paused_advance() {
+                        continue;
+                    }
                     match self.0.timer.next_timeout() {
                         Some(timeout) => std::thread::park_timeout(timeout),
                         None => std::thread::park(),
@@ -547,5 +564,31 @@ mod tests {
         rx.recv_timeout(std::time::Duration::from_secs(10))
             .expect("H3: block_on thread was never woken after a foreign timer arm");
         done.join().unwrap();
+    }
+
+    #[test]
+    fn spawned_task_timer_does_not_strand_work_at_park() {
+        // H4 regression: a timer fired by `advance_to_now` wakes a spawned
+        // task, which the owner-thread enqueue path queues *without* an
+        // unpark. If `block_on` then park()s unconditionally, the queued
+        // task is stranded forever. The asleep-in-a-spawned-task pattern is
+        // exactly what the watch/broadcast async tests exercise; this one
+        // guards it directly and would hang without the queue re-check.
+        let rt = CurrentThread::new(
+            crate::blocking::DEFAULT_MAX_BLOCKING_THREADS,
+            crate::blocking::DEFAULT_KEEP_ALIVE,
+        );
+        rt.block_on(async {
+            let handle = crate::runtime::Handle::current().spawn(async {
+                crate::time::sleep(std::time::Duration::from_millis(10)).await;
+                42
+            });
+            // Bounded so a lost wake fails loudly instead of hanging CI.
+            let value = crate::time::timeout(std::time::Duration::from_secs(10), handle)
+                .await
+                .expect("H4: spawned-task timer wake was lost")
+                .unwrap();
+            assert_eq!(value, 42);
+        });
     }
 }

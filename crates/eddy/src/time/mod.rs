@@ -1,6 +1,9 @@
 //! Runtime timers backed by a hierarchical timing wheel.
 
+mod delay_queue;
 mod wheel;
+
+pub use delay_queue::{DelayQueue, Expired, Key};
 
 use std::future::Future;
 use std::pin::Pin;
@@ -70,7 +73,7 @@ impl Drop for Sleep {
 
 /// Sleep for `duration` from the time this function is called.
 pub fn sleep(duration: Duration) -> Sleep {
-    sleep_until(Instant::now() + duration)
+    sleep_until(now() + duration)
 }
 
 /// Sleep until an absolute monotonic deadline.
@@ -80,6 +83,73 @@ pub fn sleep_until(deadline: Instant) -> Sleep {
         entry: TimerEntry::new(),
         driver: None,
     }
+}
+
+/// The runtime clock's current reading, or `Instant::now()` outside of a
+/// runtime.
+///
+/// In paused-time mode this returns the paused clock, so deadlines built from
+/// it are relative to the test clock.
+pub fn now() -> Instant {
+    if let Some(handle) = Handle::try_current() {
+        if let Some(driver) = handle.timer_driver() {
+            return driver.now_instant();
+        }
+    }
+    Instant::now()
+}
+
+/// Freeze the runtime clock. Parked schedulers stop sleeping and instead
+/// advance the clock to the next timer deadline, so `sleep(...).await` works
+/// deterministically without real time passing.
+///
+/// # Panics
+/// Panics if called outside of a runtime with a timer driver.
+pub fn pause() {
+    Handle::current()
+        .timer_driver()
+        .unwrap_or_else(|| panic!("eddy: timers require a runtime with a timer driver"))
+        .pause();
+}
+
+/// Move the paused clock forward by `duration`, firing timers that become
+/// due.
+///
+/// # Panics
+/// Panics if time is not paused or no runtime with a timer driver is running.
+pub fn advance(duration: Duration) {
+    Handle::current()
+        .timer_driver()
+        .unwrap_or_else(|| panic!("eddy: timers require a runtime with a timer driver"))
+        .advance(duration);
+}
+
+/// Unfreeze the clock, resuming real elapsed time.
+///
+/// # Panics
+/// Panics if called outside of a runtime with a timer driver.
+pub fn resume() {
+    Handle::current()
+        .timer_driver()
+        .unwrap_or_else(|| panic!("eddy: timers require a runtime with a timer driver"))
+        .resume();
+}
+
+/// Whether the runtime clock is currently paused.
+pub fn pause_enabled() -> bool {
+    Handle::current()
+        .timer_driver()
+        .is_some_and(|driver| driver.is_paused())
+}
+
+/// Toggle auto-advance: when enabled and time is paused, a scheduler that
+/// would otherwise park with no timers pending advances the clock in 1 ms
+/// steps instead of sleeping.
+pub fn auto_advance(enabled: bool) {
+    Handle::current()
+        .timer_driver()
+        .unwrap_or_else(|| panic!("eddy: timers require a runtime with a timer driver"))
+        .set_auto_advance(enabled);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,7 +189,7 @@ impl<F: Future> Future for Timeout<F> {
 }
 
 pub fn timeout<F: Future>(duration: Duration, future: F) -> Timeout<F> {
-    timeout_at(Instant::now() + duration, future)
+    timeout_at(now() + duration, future)
 }
 
 pub fn timeout_at<F: Future>(deadline: Instant, future: F) -> Timeout<F> {
@@ -156,7 +226,7 @@ impl Interval {
     pub async fn tick(&mut self) -> Instant {
         let deadline = self.next;
         (&mut self.sleep).await;
-        let now = Instant::now();
+        let now = now();
         self.next = match self.missed_tick_behavior {
             MissedTickBehavior::Burst => deadline + self.period,
             MissedTickBehavior::Delay => now + self.period,
@@ -174,7 +244,7 @@ impl Interval {
 }
 
 pub fn interval(period: Duration) -> Interval {
-    interval_at(Instant::now() + period, period)
+    interval_at(now() + period, period)
 }
 
 pub fn interval_at(start: Instant, period: Duration) -> Interval {

@@ -1,3 +1,3 @@
 [workspace]
 resolver = "2"
-members = ["crates/eddy"]
+members = ["crates/eddy", "crates/eddy-macros", "crates/eddy-console", "crates/eddy-console-web"]

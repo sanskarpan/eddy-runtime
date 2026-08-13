@@ -13,7 +13,10 @@ tracing = "0.1"
 crossbeam-utils = "0.8"
 
 [target.'cfg(loom)'.dependencies]
-loom = "0.7"
+loom = { version = "0.7", features = ["futures"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_System_IO"] }
 
 [dev-dependencies]
 criterion = "0.5"
@@ -25,6 +28,10 @@ static_assertions = "1.1.0"
 [[example]]
 name = "spike"
 path = "examples/spike.rs"
+
+[[bench]]
+name = "vs_tokio"
+harness = false
 
 [lints.rust]
 unexpected_cfgs = { level = "allow", check-cfg = ["cfg(loom)"] }

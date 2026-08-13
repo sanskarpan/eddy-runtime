@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use eddy::io::{
     copy, empty, repeat, sink, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufStream,
     BufWriter, TcpListener, TcpStream,

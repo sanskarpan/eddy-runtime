@@ -1,5 +1,7 @@
 //! Phase 5: I/O readiness driver integration tests.
 
+#![cfg(unix)]
+
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

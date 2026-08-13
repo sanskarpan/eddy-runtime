@@ -10,7 +10,7 @@ env:
 
 jobs:
   check:
-    name: fmt + clippy + tests
+    name: fmt + clippy + tests + deps
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -24,6 +24,58 @@ jobs:
         run: cargo clippy -p eddy --all-targets -- -D warnings
       - name: Test
         run: cargo test -p eddy --all-targets
+      - name: Forbid runtime deps in the main crate
+        # The oracle crates (tokio, futures) must never become runtime
+        # dependencies; `--edges normal` excludes dev-dependencies.
+        run: |
+          cargo tree -p eddy --edges normal > /tmp/runtime-deps.txt
+          if grep -qE '\b(tokio|async-std|smol|mio|polling|futures-executor)\b' /tmp/runtime-deps.txt; then
+            echo "forbidden runtime dependency found:"
+            grep -E '\b(tokio|async-std|smol|mio|polling|futures-executor)\b' /tmp/runtime-deps.txt
+            exit 1
+          fi
+          echo "no forbidden runtime dependencies"
+
+  matrix:
+    # Phase 0: run the suite on the other supported targets. aarch64-linux
+    # runs under qemu-user (weak memory ordering exposes bugs x86 hides).
+    name: tests (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          target: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test -p eddy --all-targets --target ${{ matrix.target }}
+
+  test-aarch64-linux:
+    name: tests (aarch64-unknown-linux-gnu, qemu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          target: aarch64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+      - name: Install qemu and cross linker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-user gcc-aarch64-linux-gnu
+      - name: Test under qemu
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: qemu-aarch64 -L /usr/aarch64-linux-gnu
+        run: cargo test -p eddy --all-targets --target aarch64-unknown-linux-gnu
 
   loom:
     # The Chase-Lev queue and injector are verified with loom; the model tests

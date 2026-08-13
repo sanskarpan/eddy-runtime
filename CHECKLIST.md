@@ -8,19 +8,19 @@
 
 ## Phase 0 — Bootstrap (14 tasks)
 
-- [ ] 🔴 `cargo new --lib eddy`; workspace with 4 member crates per SPEC §17
-- [ ] 🔴 `cargo add libc slab parking_lot pin-project-lite tracing crossbeam-utils`
-- [ ] 🔴 `cargo add --dev loom criterion proptest futures tokio` — **`tokio` and `futures` are test-only oracles**
-- [ ] 🔴 **Forbid runtime deps in the main crate**: CI check that `cargo tree -p eddy --edges normal` contains no `tokio`, `async-std`, `smol`, `mio`, `polling`, or `futures-executor`
+- [x]] 🔴 `cargo new --lib eddy`; workspace with 4 member crates per SPEC §17 (`crates/eddy{,-macros,-console,-console-web}`; `cargo metadata` lists 4)
+- [x] 🔴 `cargo add libc slab parking_lot pin-project-lite tracing crossbeam-utils` — all six in `crates/eddy/Cargo.toml:8`
+- [x] 🔴 `cargo add --dev loom criterion proptest futures tokio` — **`tokio` and `futures` are test-only oracles**; all five in `Cargo.toml:19`
+- [x] 🔴 **Forbid runtime deps in the main crate**: CI check that `cargo tree -p eddy --edges normal` contains no `tokio`, `async-std`, `smol`, `mio`, `polling`, or `futures-executor`
 - [x] 🔴 `[target.'cfg(loom)'.dependencies] loom = "0.7"` with a `loom` cfg flag and a `sync` shim module re-exporting either `std::sync` or `loom::sync`
 - [x] 🔴 `#![deny(clippy::undocumented_unsafe_blocks)]` workspace-wide
-- [ ] 🔴 CI matrix: `x86_64-linux`, `aarch64-linux` (QEMU — **weak memory ordering exposes bugs x86 hides**), `aarch64-macos`, `x86_64-windows`
+- [x] 🔴 CI matrix: `x86_64-linux`, `aarch64-linux` (QEMU — **weak memory ordering exposes bugs x86 hides**), `aarch64-macos`, `x86_64-windows`
 - [x] 🔴 CI jobs: `test`, `test-loom` (`RUSTFLAGS="--cfg loom"`), `miri` (bench not in CI)
-- [ ] 🔴 `Makefile`/`justfile`: `test`, `loom`, `miri`, `bench`, `bench-vs-tokio`, `console`, `console-web`
+- [x] 🔴 `Makefile`/`justfile`: `test`, `loom`, `miri`, `bench`, `bench-vs-tokio`, `console`, `console-web`
 - [x] 🔴 `util/rand.rs`: xorshift `FastRand` for steal-victim selection (no `rand` dependency)
 - [x] 🔴 `util/linked_list.rs`: intrusive doubly-linked list with `Pointers<T>` — used by waiter lists and the timer wheel (SB-hardened, Miri-clean)
-- [ ] 🔴 `cd console-ui && bun create vite . --template react-ts`
-- [ ] 🔴 `bun add d3 @dagrejs/dagre recharts zustand clsx lucide-react`; `bun add -d tailwindcss postcss autoprefixer @types/d3`; `bunx shadcn@latest init` + `button card table tabs badge tooltip separator scroll-area resizable select slider`
+- [x]] 🔴 `cd console-ui && bun create vite . --template react-ts` (`console-ui/`, vite react-ts)
+- [x]] 🔴 `bun add d3 @dagrejs/dagre recharts zustand clsx lucide-react`; `bun add -d tailwindcss postcss autoprefixer @types/d3`; `bunx shadcn@latest init` + `button card table tabs badge tooltip separator scroll-area resizable select slider` (`console-ui/`; 10 UI components added)
 - [x] 🔴 Spike: hand-write a `Waker` with a `RawWakerVTable`, poll a trivial future to completion on one thread, no dependencies. **Do this first** — if the vtable refcounting is wrong, everything above it is unfixable.
 
 ---
@@ -35,7 +35,7 @@
 - [x] 🔴 `RawTask(NonNull<Header>)` — one word, type-erased, vtable reached through the header
 - [x] 🔴 `Vtable` with `poll`, `schedule`, `dealloc`, `try_read_output`, `drop_join_handle_slow`, `shutdown`
 - [x] 🔴 `vtable::<F, S>()` const fn producing a `&'static Vtable` per (future, scheduler) pair
-- [ ] 🔴 **`queue_next` is the intrusive link** — the global injector is a list threaded through tasks, allocating nothing per push
+- [x] 🔴 **`queue_next` is the intrusive link** — the global injector is a list threaded through tasks, allocating nothing per push (`scheduler/multi_thread/inject.rs`) and the current-thread scheduler's injection list
 
 **State machine**
 - [x] 🔴 Packed state: `[ refcount : 48 ][ flags : 16 ]` in one `AtomicUsize`
@@ -179,8 +179,8 @@
 - [x] 🔴 `EPOLLRDHUP` handling for half-close detection
 - [x] 🟡 **macOS/BSD kqueue**: `kqueue()`, `kevent()` with `EVFILT_READ`/`EVFILT_WRITE`
 - [x] 🟡 kqueue reports read and write as **separate events** — must be merged into one `Ready`
-- [ ] 🟡 **Windows IOCP**: `CreateIoCompletionPort`, `GetQueuedCompletionStatusEx`
-- [ ] 🟡 IOCP is completion-based; emulate readiness with zero-byte `WSARecv` (this is what mio does, and it's worth documenting why)
+- [x] 🟡 **Windows IOCP**: `CreateIoCompletionPort`, `GetQueuedCompletionStatusEx` — native backend in `sys/iocp.rs`: sockets associated to a completion port with the token as the completion key; `wait` drains `GetQueuedCompletionStatusEx` into the driver's event vector; wakes are `PostQueuedCompletionStatus` sentinels; verified via `cargo check/clippy --target x86_64-pc-windows-msvc` (the driver, `PollEvented` and net types are `#[cfg(unix)]`; the io driver compiles for Windows through a platform `Fd` alias in `sys/mod.rs`)
+- [x] 🟡 IOCP is completion-based; emulate readiness with zero-byte `WSARecv` (this is what mio does, and it's worth documenting why) — one outstanding zero-byte `WSARecv` probe per socket registered for reads; probes complete only when the socket becomes readable or closes, and are re-issued per completion for level-triggered semantics (mirroring epoll LT). Two quirks documented in `sys/iocp.rs`: a zero-byte receive that finds buffered data completes synchronously with no completion packet (reported through an internal pending list), and there is no completion-based write probe — writes are approximated with a one-shot `WRITABLE` plus re-reporting on every read completion
 - [x] 🔴 **Waker fd**: `eventfd` (Linux) / `EVFILT_USER` (kqueue) / `PostQueuedCompletionStatus` (Windows) to interrupt a blocking wait
 
 **Registration**
@@ -229,8 +229,8 @@
 - [x] 🔴 `Sleep::reset(new_deadline)` without reallocating — the entry is removed and reinserted
 - [x] 🔴 `timeout(dur, fut)` — `Timeout` combinator returning `Result<T, Elapsed>`
 - [x] 🔴 `interval(period)` with `MissedTickBehavior::{ Burst, Delay, Skip }`
-- [ ] 🟡 `DelayQueue<T>` for expiring collections (connection reaping)
-- [ ] 🟡 Paused-time mode for tests: `time::pause()`, `time::advance(dur)`, auto-advance when all tasks are idle
+- [x] 🟡 `DelayQueue<T>` for expiring collections (connection reaping) — `time/delay_queue.rs`: `insert_at`/`remove`/`remove_if`/`next`/`poll_expired`, opaque `Key`, `Expired { key, deadline, item }`; per-entry wheel timer through a shared FireSink waker so any worker's fire wakes the poller; keys from an `AtomicU64` counter into a `HashMap`, delivered in deadline order (verified in `tests/time.rs`)
+- [x] 🟡 Paused-time mode for tests: `time::pause()`, `time::advance(dur)`, auto-advance when all tasks are idle — `TimerShared` gains paused state + `now_instant()`; `arm` compares deadlines against the paused clock; `sleep`/`interval`/`timeout`/`now` build deadlines from the driver clock; parked schedulers (current-thread loop and multi-thread io driver) call `paused_advance()` instead of sleeping — jumping to the next timer deadline, or stepping 1 ms with `time::auto_advance(true)` when nothing is pending
 - [x] 🔴 Test: 100k timers inserted and cancelled — **O(1) confirmed by timing, not just asymptotics**
 - [x] 🔴 Test: timers fire in deadline order
 - [x] 🔴 Test: timer never fires early; lateness bounded by one tick + scheduling latency
@@ -309,9 +309,9 @@
 - [x] 🔴 `Receiver::recv()` — **cancel safe**; a cancelled recv leaves the message in the channel
 - [x] 🔴 `recv_many(&mut Vec, limit)` for batching
 - [x] 🔴 Channel closes when all senders or the receiver drop
-- [ ] 🟡 `broadcast::channel(cap)` — ring buffer, per-receiver cursor
-- [ ] 🟡 `RecvError::Lagged(n)` when a receiver falls behind — slow receivers must not stall the sender
-- [ ] 🟡 `watch::channel(init)` — latest value, `changed().await`, `borrow_and_update`
+- [x] 🟡 `broadcast::channel(cap)` — ring buffer, per-receiver cursor
+- [x] 🟡 `RecvError::Lagged(n)` when a receiver falls behind — slow receivers must not stall the sender
+- [x] 🟡 `watch::channel(init)` — latest value, `changed().await`, `borrow_and_update`
 
 **Tests**
 - [x] 🔴 Test: Mutex under 100 concurrent tasks — mutual exclusion holds, FIFO fairness observed
@@ -319,9 +319,9 @@
 - [x] 🔴 Test: Notify permit — `notify_one()` before `notified().await` still wakes
 - [x] 🔴 Test: mpsc backpressure — bounded send blocks when full, resumes on recv
 - [x] 🔴 **Test: cancel `recv()` mid-flight → message not lost**
-- [ ] 🔴 **loom: semaphore acquire/release with 2 waiters**
-- [ ] 🔴 **loom: oneshot send racing with receiver drop**
-- [ ] 🔴 **loom: Notify permit races**
+- [x] 🔴 **loom: semaphore acquire/release with 2 waiters**
+- [x] 🔴 **loom: oneshot send racing with receiver drop**
+- [x] 🔴 **loom: Notify permit races**
 
 ---
 
@@ -331,20 +331,20 @@
 - [x] 🔴 `try_join!` — short-circuit on first `Err`
 - [x] 🔴 `select!` macro — poll branches in **random order** by default to avoid starving later branches
 - [x] 🔴 `select!` with `biased;` for deterministic priority order
-- [ ] 🔴 `select!` `else` and `if` guards on branches
+- [x] 🔴 `select!` `else` and `if` guards on branches
 - [x] 🔴 **`select!` drops the losing futures** — document that this is cancellation, and link to cancel safety
 - [x] 🔴 `race(a, b)` for same-typed futures
 - [x] 🔴 `timeout(dur, fut)` / `timeout_at(deadline, fut)`
-- [ ] 🟡 `FuturesUnordered` — dynamic set with an intrusive ready-list so only woken members are polled (not O(n) per poll)
-- [ ] 🟡 `JoinSet` — spawn into a set, `join_next().await`, `abort_all()`
-- [ ] 🟡 `StreamExt` basics if a `Stream` trait is included
+- [x] 🟡 `FuturesUnordered` — dynamic set with an intrusive ready-list so only woken members are polled (not O(n) per poll)
+- [x] 🟡 `JoinSet` — spawn into a set, `join_next().await`, `abort_all()`
+- [x] 🟡 `StreamExt` basics if a `Stream` trait is included
 - [x] 🔴 `poll_fn`, `pending`, `ready`, `yield_now`
 - [x] 🟡 `CancellationToken` — `cancelled().await`, `child_token()`, structured cancellation trees
 - [x] 🔴 Test: `join!` — all complete, results in order
 - [x] 🔴 Test: `select!` — loser is dropped exactly once
 - [x] 🔴 Test: `select!` branch fairness over 10,000 iterations (random ordering actually randomizes)
 - [x] 🔴 Test: `timeout` — both the completion and the elapsed path
-- [ ] 🟡 Test: `FuturesUnordered` with 10k members polls only woken ones (instrument poll counts)
+- [x] 🟡 Test: `FuturesUnordered` with 10k members polls only woken ones (instrument poll counts)
 
 ---
 
@@ -517,19 +517,19 @@
 ## Phase 17 — Correctness: loom, Miri, Differential (24 tasks)
 
 **loom** — *the* correctness tool for this project
-- [ ] 🔴 `sync` shim module re-exporting `loom::sync` under `--cfg loom`
+- [x] 🔴 `sync` shim module re-exporting `loom::sync` under `--cfg loom` (`crates/eddy/src/loom.rs`)
 - [ ] 🔴 loom: task state transitions (poll / wake / complete / abort interleavings)
-- [ ] 🔴 loom: refcount + dealloc — exactly one dealloc, never early
-- [ ] 🔴 **loom: wake during poll** — never lost, never double-queued
-- [ ] 🔴 loom: Chase-Lev push/pop/steal with 1 producer + 2 thieves
-- [ ] 🔴 loom: `push_overflow` racing with a steal
-- [ ] 🔴 loom: injector concurrent push/pop
+- [x] 🔴 loom: refcount + dealloc — exactly one dealloc, never early (waker.rs loom_tests `refcount_is_exact_under_concurrent_clone_drop`)
+- [x] 🔴 **loom: wake during poll** — never lost, never double-queued (waker.rs loom_tests `wake_during_poll_is_never_lost`)
+- [x] 🔴 loom: Chase-Lev push/pop/steal with 1 producer + 2 thieves (queue.rs loom_tests `two_thieves_do_not_duplicate_or_drop_items`)
+- [x] 🔴 loom: `push_overflow` racing with a steal (queue.rs loom_tests `push_overflow_racing_a_steal_never_loses_or_duplicates_tasks`)
+- [x] 🔴 loom: injector concurrent push/pop (inject.rs loom_tests `concurrent_push_pop_preserves_every_task_exactly_once`)
 - [ ] 🔴 loom: semaphore acquire/release/close
-- [ ] 🔴 loom: `Notify` permit races
-- [ ] 🔴 loom: oneshot send / recv / drop races
+- [x] 🔴 loom: `Notify` permit races (notify.rs loom_tests: registration race + registered-waiter wake)
+- [x] 🔴 loom: oneshot send / recv / drop races (oneshot.rs loom_tests `send_racing_with_receiver_drop_is_safe_and_consistent`)
 - [ ] 🔴 loom: `ScheduledIo` readiness + waker registration races
 - [ ] 🔴 loom: timer entry fire vs cancel race
-- [ ] 🔴 **CI runs loom on every PR** (bounded preemptions to keep it under 10 minutes)
+- [x] 🔴 **CI runs loom on every PR** (bounded preemptions to keep it under 10 minutes)
 
 **Miri**
 - [x] 🔴 Miri over the task allocation, waker vtable, intrusive lists, `ReadBuf` (task/waker/intrusive lists done — 35 lib tests clean; `ReadBuf`/io paths call foreign syscalls Miri cannot run, covered by the other gate jobs)

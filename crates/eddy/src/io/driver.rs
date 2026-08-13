@@ -8,7 +8,6 @@
 //! for a condvar sleeper uses the condvar.
 
 use std::io;
-use std::os::fd::RawFd;
 use std::pin::Pin;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -17,6 +16,8 @@ use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use slab::Slab;
+
+use crate::sys::Fd;
 
 use crate::sys::{set_nonblocking, Event, Interest, Poller, PollerImpl, Ready, Token};
 use crate::time::TimerShared;
@@ -491,7 +492,7 @@ impl DriverShared {
     }
 
     /// Register an fd. The slab slot becomes the poller token.
-    pub(crate) fn register(&self, fd: RawFd, interest: Interest) -> io::Result<Arc<ScheduledIo>> {
+    pub(crate) fn register(&self, fd: Fd, interest: Interest) -> io::Result<Arc<ScheduledIo>> {
         set_nonblocking(fd)?;
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         let scheduled = Arc::new(ScheduledIo::new(generation));
@@ -511,7 +512,7 @@ impl DriverShared {
     /// already in flight for the old token is discarded by the dispatcher:
     /// either the slab slot is free, or it holds a later registration with a
     /// different generation.
-    pub(crate) fn deregister(&self, scheduled: &ScheduledIo, fd: RawFd) {
+    pub(crate) fn deregister(&self, scheduled: &ScheduledIo, fd: Fd) {
         let _ = self.poller.deregister(fd);
         let mut slab = self.slab.lock().unwrap();
         if let Some(index) = slab
@@ -531,13 +532,20 @@ impl DriverShared {
         if state.holder.is_none() {
             state.holder = Some(id);
             drop(state);
-            let events = {
-                let mut buffer = self.events.lock().unwrap();
-                let _ = self.poller.wait(&mut buffer, self.timer.next_timeout());
-                std::mem::take(&mut *buffer)
-            };
-            self.timer.advance_to_now();
-            self.dispatch(&events);
+            if self.timer.is_paused() {
+                // Paused time: never block in the kernel; advance the clock
+                // to the next timer deadline instead. The worker loop
+                // re-checks its queues after park returns.
+                self.timer.paused_advance();
+            } else {
+                let events = {
+                    let mut buffer = self.events.lock().unwrap();
+                    let _ = self.poller.wait(&mut buffer, self.timer.next_timeout());
+                    std::mem::take(&mut *buffer)
+                };
+                self.timer.advance_to_now();
+                self.dispatch(&events);
+            }
             let mut state = self.park.lock().unwrap();
             state.holder = None;
             // A condvar sleeper may now take over as the driver holder.

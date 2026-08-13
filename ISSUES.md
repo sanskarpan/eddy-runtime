@@ -10,6 +10,8 @@ checklist/test hygiene.
 L4 is the only exception: the proposed drain loop cannot be implemented in a
 one-stream-per-call `accept()` API (see L4 below) and was reverted after
 verification.
+H4 (below) was found later during Phase 8/9 feature work (async broadcast/watch
+tests were the first to sleep in a spawned task on the current-thread runtime).
 
 Legend: **C** = critical (memory unsafety / permanent deadlock) · **H** = high
 (hang or unsoundness in realistic use) · **M** = medium (wrong semantics or
@@ -158,6 +160,32 @@ sync 2, time wheel 4, linked_list 1, rand 1) and CI now runs it
 ---
 
 ## High
+
+### H4 — Current-thread `block_on` can park forever with a fired timer's task queued
+
+**Location:** `scheduler/current_thread.rs` (`block_on` park loop).
+
+**Problem.** A `Sleep` awaited inside a *spawned* task (not the root future)
+fires during `timer.advance_to_now()` in the park arm of `block_on`. Waking
+that task goes through the owner-thread enqueue fast path (`local` push,
+current_thread.rs:94-96), which does **not** unpark. The loop then calls
+`park()` (or a bounded `park_timeout` that delays, not wakes) while the task
+sits in `local` — a permanent hang when the wheel is empty (`None` timeout).
+
+The root-future case never hits this: the root waker is the thread-signal
+waker, which unparks directly. Every pre-existing test slept either in the
+root future or on a multi-thread runtime, so the gap went unnoticed.
+
+**Fix.** After `advance_to_now()`, re-check `deferred`/`local`/`injection`
+before parking; if any is non-empty, `continue` the loop and pick up the
+queued task. A racing injection enqueue is still safe: the injection path
+always unparks the owner.
+
+**Tests.** `spawned_task_timer_does_not_strand_work_at_park` (spawned task
+sleeps, `block_on` must complete) — hangs on the old code; also exercised by
+the watch/broadcast async tests, which were the first to hit it.
+
+---
 
 ### H1 — Park lost-wakeup: worker can block forever with work in its injector
 

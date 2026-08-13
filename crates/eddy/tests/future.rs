@@ -159,6 +159,121 @@ fn default_select_alternates_immediately_ready_branches() {
 }
 
 #[test]
+fn select_else_runs_when_all_branches_disabled_by_guards() {
+    let runtime = Builder::new_current_thread().build();
+    runtime.block_on(async {
+        let value = eddy::select! {
+            a = ready(1), if false => a,
+            b = ready(2), if false => b,
+            else => 42,
+        };
+        assert_eq!(value, 42);
+        let biased = eddy::select! {
+            biased;
+            a = ready(1), if false => a,
+            b = ready(2), if false => b,
+            else => 43
+        };
+        assert_eq!(biased, 43);
+    });
+}
+
+#[test]
+#[should_panic(expected = "all branches are disabled and there is no else branch")]
+fn select_without_else_panics_when_all_branches_disabled() {
+    let runtime = Builder::new_current_thread().build();
+    runtime.block_on(async {
+        let _ = eddy::select! {
+            a = ready(1), if false => a,
+            b = ready(2), if false => b,
+        };
+    });
+}
+
+#[test]
+fn select_guard_expression_is_evaluated_exactly_once() {
+    let runtime = Builder::new_current_thread().build();
+    runtime.block_on(async {
+        let evaluated = std::sync::Arc::new(AtomicUsize::new(0));
+        let side = std::sync::Arc::clone(&evaluated);
+        let value = eddy::select! {
+            a = ready(1), if { side.fetch_add(1, Ordering::SeqCst); false } => a,
+            b = ready(2), if true => b,
+            else => 42,
+        };
+        assert_eq!(value, 2);
+        assert_eq!(evaluated.load(Ordering::SeqCst), 1);
+    });
+}
+
+#[test]
+fn select_pattern_mismatch_disables_branch_and_waits_for_other() {
+    let runtime = Builder::new_current_thread().build();
+    runtime.block_on(async {
+        // `Some(3)` fails against `Some(4)`: the first branch is disabled and
+        // the second one wins even though the loser resolved first.
+        let value = eddy::select! {
+            Some(3) = ready(Some(4)) => 3,
+            b = ready(7) => b,
+            else => 0,
+        };
+        assert_eq!(value, 7);
+    });
+}
+
+#[test]
+fn select_mismatch_and_guard_together_reach_else() {
+    let runtime = Builder::new_current_thread().build();
+    runtime.block_on(async {
+        let value = eddy::select! {
+            Some(3) = ready(Some(4)) => 3,
+            b = ready(9), if false => b,
+            else => 42,
+        };
+        assert_eq!(value, 42);
+    });
+}
+
+#[test]
+fn select_else_break_exits_user_loop() {
+    let runtime = Builder::new_current_thread().build();
+    runtime.block_on(async {
+        // The first branch's pattern keeps failing once `n == 3`, disabling
+        // the branch; `else => break` must exit the *user's* loop.
+        let mut n = 0;
+        loop {
+            eddy::select! {
+                Some(v) = ready(if n < 3 { Some(n) } else { None }) => n = v + 1,
+                else => break,
+            }
+        }
+        assert_eq!(n, 3);
+    });
+}
+
+#[test]
+fn select_biased_prefers_first_branch_each_round() {
+    let runtime = Builder::new_current_thread().build();
+    runtime.block_on(async {
+        let mut left = 0;
+        let mut right = 0;
+        for _ in 0..10_000 {
+            match eddy::select! {
+                biased;
+                _ = ready(()) => 1,
+                _ = ready(()) => 2,
+            } {
+                1 => left += 1,
+                2 => right += 1,
+                _ => unreachable!(),
+            }
+        }
+        assert_eq!(right, 0);
+        assert_eq!(left, 10_000);
+    });
+}
+
+#[test]
 fn timeout_at_and_yield_now_work() {
     let runtime = Builder::new_current_thread().build();
     runtime.block_on(async {

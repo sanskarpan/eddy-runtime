@@ -290,6 +290,9 @@ pub(crate) struct TimerShared {
     origin: Instant,
     wheel: Mutex<Wheel>,
     notify: Arc<dyn Fn() + Send + Sync>,
+    paused: AtomicBool,
+    paused_elapsed: AtomicU64,
+    auto_advance: AtomicBool,
 }
 
 impl TimerShared {
@@ -298,15 +301,81 @@ impl TimerShared {
             origin: Instant::now(),
             wheel: Mutex::new(Wheel::new()),
             notify,
+            paused: AtomicBool::new(false),
+            paused_elapsed: AtomicU64::new(0),
+            auto_advance: AtomicBool::new(false),
         })
     }
 
     pub(crate) fn now_ms(&self) -> u64 {
+        if self.paused.load(Ordering::Acquire) {
+            self.paused_elapsed.load(Ordering::Acquire)
+        } else {
+            self.real_elapsed_ms()
+        }
+    }
+
+    /// The clock as an `Instant`, for deadline arithmetic (paused-aware).
+    pub(crate) fn now_instant(&self) -> Instant {
+        self.origin + Duration::from_millis(self.now_ms())
+    }
+
+    fn real_elapsed_ms(&self) -> u64 {
         self.origin.elapsed().as_millis().min(u64::MAX as u128) as u64
     }
 
+    /// Freeze the clock at its current reading.
+    pub(crate) fn pause(&self) {
+        if !self.paused.swap(true, Ordering::AcqRel) {
+            self.paused_elapsed
+                .store(self.real_elapsed_ms(), Ordering::Release);
+        }
+    }
+
+    /// Unfreeze the clock, resuming real elapsed time.
+    pub(crate) fn resume(&self) {
+        self.paused.store(false, Ordering::Release);
+    }
+
+    pub(crate) fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_auto_advance(&self, enabled: bool) {
+        self.auto_advance.store(enabled, Ordering::Release);
+    }
+
+    /// Move the paused clock forward by `duration`, firing whatever becomes
+    /// due.
+    pub(crate) fn advance(&self, duration: Duration) {
+        assert!(self.is_paused(), "eddy: advance requires paused time");
+        let ms = duration
+            .as_millis()
+            .saturating_add(u128::from(duration.subsec_nanos() % 1_000_000 != 0))
+            .min(u64::MAX as u128) as u64;
+        self.paused_elapsed.fetch_add(ms, Ordering::AcqRel);
+        self.advance_to_now();
+    }
+
+    /// Advance the paused clock to the next timer deadline, or by the 1 ms
+    /// auto-advance step when nothing is pending. Returns whether the clock
+    /// moved. Never sleeps; park loops call this instead of blocking when
+    /// time is paused.
+    pub(crate) fn paused_advance(&self) -> bool {
+        if !self.is_paused() {
+            return false;
+        }
+        let step = match self.next_timeout() {
+            Some(timeout) => timeout,
+            None if self.auto_advance.load(Ordering::Acquire) => Duration::from_millis(1),
+            None => return false,
+        };
+        self.advance(step);
+        true
+    }
+
     pub(crate) fn arm(&self, entry: &Arc<TimerEntry>, deadline: Instant, waker: Waker) -> bool {
-        let already_due = deadline <= Instant::now();
+        let already_due = deadline <= self.now_instant();
         let deadline = self.instant_to_ms(deadline);
         let mut wheel = self.wheel.lock().unwrap();
         wheel.remove(entry);

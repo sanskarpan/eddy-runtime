@@ -1,9 +1,10 @@
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
+
+use crate::loom::sync::atomic::{AtomicBool, Ordering};
+use crate::loom::sync::{Arc, Mutex};
 
 struct Waiter {
     notified: AtomicBool,
@@ -150,5 +151,60 @@ impl Drop for Notified<'_> {
         state
             .waiters
             .retain(|waiter| !Arc::ptr_eq(waiter, &self.waiter));
+    }
+}
+
+#[cfg(all(test, loom))]
+mod loom_tests {
+    use super::*;
+
+    #[test]
+    fn notify_one_racing_with_registration_is_never_lost() {
+        // The permit is the whole point of `Notify`: whether the notify lands
+        // before the waiter registers (permit consumed later) or after (waiter
+        // woken directly), the future must resolve.
+        loom::model(|| {
+            let notify: crate::loom::sync::Arc<Notify> = crate::loom::sync::Arc::new(Notify::new());
+            let notifier = {
+                let notify = notify.clone();
+                loom::thread::spawn(move || {
+                    notify.notify_one();
+                })
+            };
+            loom::future::block_on(notify.notified());
+            notifier.join().unwrap();
+
+            // A second notify now must park as a permit, not vanish — a later
+            // waiter must still be woken.
+            notify.notify_one();
+            loom::future::block_on(notify.notified());
+        });
+    }
+
+    #[test]
+    fn notify_one_wakes_a_registered_waiter() {
+        // The inverse of the permit race: the waiter registers first (its
+        // initial poll returns Pending) and the notify that lands afterwards
+        // must wake it directly rather than being parked as a permit that the
+        // already-registered future would never consume.
+        loom::model(|| {
+            let notify: crate::loom::sync::Arc<Notify> = crate::loom::sync::Arc::new(Notify::new());
+            let mut notified = Box::pin(notify.notified());
+            let waker = futures::task::noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            // Register the waiter before any notify can exist; the first poll
+            // must be Pending (the permit path is its own race, exercised by
+            // the test above).
+            assert!(notified.as_mut().poll(&mut cx).is_pending());
+            // The notify that now lands must resolve the registered waiter.
+            let notifier = {
+                let notify = notify.clone();
+                loom::thread::spawn(move || {
+                    notify.notify_one();
+                })
+            };
+            loom::future::block_on(notified);
+            notifier.join().unwrap();
+        });
     }
 }

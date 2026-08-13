@@ -7,25 +7,32 @@
 
 pub mod buf;
 pub(crate) mod driver;
+#[cfg(unix)]
 pub mod net;
 pub mod ops;
+#[cfg(unix)]
 pub mod poll_evented;
 #[cfg(unix)]
 pub mod unix;
 
 use std::io;
 use std::mem::MaybeUninit;
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::pin::Pin;
+#[cfg(unix)]
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+#[cfg(unix)]
 use driver::{DriverShared, ScheduledIo};
 
 pub use buf::{AsyncBufRead, AsyncBufReadExt, BufReader, BufStream, BufWriter, Lines};
 pub use driver::{Readiness, ReadyEvent};
+#[cfg(unix)]
 pub use net::{TcpListener, TcpStream, UdpSocket};
 pub use ops::{copy, copy_bidirectional, empty, repeat, sink, Empty, Repeat, Sink};
+#[cfg(unix)]
 pub use poll_evented::PollEvented;
 #[cfg(unix)]
 pub use unix::{UnixDatagram, UnixListener, UnixStream};
@@ -340,6 +347,7 @@ impl Ready {
 /// The fd must already be non-blocking; registration is ownership transfer
 /// (the fd is closed when the registration drops). `Registration` is
 /// `Send + Sync` and can be moved between tasks.
+#[cfg(unix)]
 pub struct Registration {
     _driver: Arc<DriverShared>,
     scheduled: Arc<ScheduledIo>,
@@ -347,6 +355,7 @@ pub struct Registration {
     interests: Interest,
 }
 
+#[cfg(unix)]
 impl Registration {
     /// Register `fd` with the current runtime's driver.
     ///
@@ -419,6 +428,7 @@ impl Registration {
     }
 }
 
+#[cfg(unix)]
 impl Drop for Registration {
     fn drop(&mut self) {
         self._driver

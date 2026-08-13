@@ -1,8 +1,9 @@
+use std::future::Future;
 use std::marker::{PhantomData, PhantomPinned};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
+use crate::loom::sync::{Arc, Mutex};
 use crate::util::{Linked, LinkedList, Pointers};
 
 struct Waiter {
@@ -228,11 +229,15 @@ impl Semaphore {
         Acquire::new(self.inner.clone(), permits)
     }
 
-    pub fn acquire_owned(self: Arc<Self>) -> Acquire<'static> {
+    // NOTE: the receiver must be `std::sync::Arc` (not the loom shim) —
+    // `self: Arc<Self>` relies on `std::sync::Arc` implementing `Receiver`,
+    // which `loom::sync::Arc` does not. Owned acquisition is not part of any
+    // loom model, so this is the one place the shim is not used.
+    pub fn acquire_owned(self: std::sync::Arc<Self>) -> Acquire<'static> {
         self.acquire_many_owned(1)
     }
 
-    pub fn acquire_many_owned(self: Arc<Self>, permits: usize) -> Acquire<'static> {
+    pub fn acquire_many_owned(self: std::sync::Arc<Self>, permits: usize) -> Acquire<'static> {
         assert!(
             permits > 0,
             "eddy: semaphore acquire count must be non-zero"
@@ -293,9 +298,48 @@ impl Semaphore {
     }
 }
 
-use std::future::Future;
+#[cfg(all(test, loom))]
+mod loom_tests {
+    use super::*;
+    use crate::loom::sync::atomic::Ordering as LoomOrdering;
 
-#[cfg(test)]
+    #[test]
+    fn acquire_release_with_two_waiters_never_loses_a_permit() {
+        // FIFO chain: with one permit, the first waiter takes it directly and
+        // the second parks. The permit then reaches the parked waiter through
+        // the release chain (`add_permits`, or the first waiter dropping its
+        // grant). A lost wake would leave the parked waiter blocked forever
+        // and fail the join assertion (or deadlock the model). The preemption
+        // bound keeps the park/wake interleaving space tractable while still
+        // exploring both sides of the registration-vs-release race.
+        let mut builder = loom::model::Builder::new();
+        builder.preemption_bound = Some(2);
+        builder.check(|| {
+            let semaphore = Arc::new(Semaphore::new(1));
+            let granted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut threads = Vec::new();
+            for _ in 0..2 {
+                let semaphore = semaphore.clone();
+                let granted = granted.clone();
+                threads.push(loom::thread::spawn(move || {
+                    let output = loom::future::block_on(semaphore.acquire());
+                    assert!(output.is_ok(), "a waiting acquire must never fail");
+                    granted.fetch_add(1, LoomOrdering::AcqRel);
+                }));
+            }
+            // Give the second waiter time to park, then release from a
+            // third thread (the model also explores the other orderings).
+            loom::thread::yield_now();
+            semaphore.add_permits(1);
+            for thread in threads {
+                thread.join().unwrap();
+            }
+            assert_eq!(granted.load(LoomOrdering::Acquire), 2);
+        });
+    }
+}
+
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
 

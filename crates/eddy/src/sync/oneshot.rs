@@ -1,7 +1,8 @@
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
+
+use crate::loom::sync::{Arc, Mutex};
 
 struct State<T> {
     value: Option<T>,
@@ -167,5 +168,32 @@ impl<T> Drop for Sender<T> {
         if let Some(waker) = waker {
             waker.wake();
         }
+    }
+}
+
+#[cfg(all(test, loom))]
+mod loom_tests {
+    use super::*;
+
+    #[test]
+    fn send_racing_with_receiver_drop_is_safe_and_consistent() {
+        // The classic oneshot tear-down race: a concurrent `send` must either
+        // observe the receiver as alive (and win) or observe the drop (and
+        // return the value back in `SendError`). It must never panic, never
+        // lose the value, and never wake a receiver that was already dropped.
+        loom::model(|| {
+            let (sender, receiver) = channel::<usize>();
+            let sender_thread = loom::thread::spawn(move || {
+                let outcome = sender.send(7);
+                match outcome {
+                    Ok(()) => {}
+                    Err(SendError(value)) => assert_eq!(value, 7),
+                }
+            });
+            // Let the model explore both orders: drop before the send lands
+            // and send landing before the drop.
+            drop(receiver);
+            sender_thread.join().unwrap();
+        });
     }
 }

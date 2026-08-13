@@ -4,12 +4,10 @@
 //! `crate::io::driver`) is written against the trait, so it stays
 //! platform-agnostic; only the syscall layer below is per-OS.
 //!
-//! Windows is deliberately a stub: IOCP is completion-based, not
-//! readiness-based, and emulating readiness (as mio does) requires issuing
-//! zero-byte `WSARecv` probes on every registration and mapping each
-//! completion back to a readiness report — a fundamentally different driver
-//! architecture. See `iocp.rs` for the rationale; the stub fails
-//! construction with a clear error until a native backend lands.
+//! On Windows, IOCP is completion-based rather than readiness-based, so the
+//! backend (`sys/iocp.rs`) emulates readiness with outstanding zero-byte
+//! `WSARecv` probes — the same approach legacy mio took — and is verified by
+//! cross-compilation only.
 
 #[cfg(target_os = "linux")]
 mod epoll;
@@ -19,10 +17,16 @@ mod iocp;
 mod kqueue;
 
 use std::io;
-use std::os::fd::RawFd;
 use std::time::Duration;
 
 pub(crate) use crate::io::{Interest, Ready};
+
+/// The platform's native socket descriptor: a file descriptor on unix, an
+/// OS handle (`SOCKET`) on Windows.
+#[cfg(unix)]
+pub(crate) type Fd = std::os::fd::RawFd;
+#[cfg(windows)]
+pub(crate) type Fd = std::os::windows::io::RawSocket;
 
 #[cfg(target_os = "linux")]
 pub(crate) use self::epoll::Epoll as PollerImpl;
@@ -32,7 +36,7 @@ pub(crate) use self::iocp::Iocp as PollerImpl;
 pub(crate) use self::kqueue::Kqueue as PollerImpl;
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 compile_error!(
-    "eddy: the I/O driver currently supports Linux (epoll), macOS (kqueue) and Windows (stub)"
+    "eddy: the I/O driver currently supports Linux (epoll), macOS (kqueue) and Windows (IOCP)"
 );
 
 /// A 64-bit event token: the high 32 bits are a generation counter, the low
@@ -81,12 +85,12 @@ pub(crate) trait Poller: Send + Sync {
     where
         Self: Sized;
 
-    fn register(&self, fd: RawFd, token: Token, interest: Interest) -> io::Result<()>;
+    fn register(&self, fd: Fd, token: Token, interest: Interest) -> io::Result<()>;
 
     #[allow(dead_code)]
-    fn reregister(&self, fd: RawFd, token: Token, interest: Interest) -> io::Result<()>;
+    fn reregister(&self, fd: Fd, token: Token, interest: Interest) -> io::Result<()>;
 
-    fn deregister(&self, fd: RawFd) -> io::Result<()>;
+    fn deregister(&self, fd: Fd) -> io::Result<()>;
 
     /// Block until at least one event is ready or `timeout` elapses.
     /// `None` blocks indefinitely; the returned events are appended to
@@ -99,7 +103,7 @@ pub(crate) trait Poller: Send + Sync {
 }
 
 #[cfg(unix)]
-pub(crate) fn set_nonblocking(fd: RawFd) -> io::Result<()> {
+pub(crate) fn set_nonblocking(fd: Fd) -> io::Result<()> {
     // SAFETY: `fd` is a valid open descriptor provided by the caller; fcntl
     // F_GETFL takes no other arguments.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
@@ -115,11 +119,15 @@ pub(crate) fn set_nonblocking(fd: RawFd) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-pub(crate) fn set_nonblocking(_fd: RawFd) -> io::Result<()> {
-    // Requires `ioctlsocket(FIONBIO)`, which needs the windows-sys crate;
-    // the IOCP stub never reaches here anyway.
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "eddy: non-blocking fd setup is not implemented on Windows",
-    ))
+pub(crate) fn set_nonblocking(fd: Fd) -> io::Result<()> {
+    use windows_sys::Win32::Networking::WinSock::{ioctlsocket, FIONBIO, SOCKET, SOCKET_ERROR};
+
+    let mut mode: u32 = 1;
+    // SAFETY: `fd` is the caller's socket; `FIONBIO` only reads the mode
+    // value, which sits in a live `u32`.
+    let rc = unsafe { ioctlsocket(fd as SOCKET, FIONBIO as i32, &mut mode) };
+    if rc == SOCKET_ERROR {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }

@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use eddy::io::{AsyncReadExt, AsyncWriteExt, TcpListener, TcpStream, UdpSocket};
 use eddy::Builder;
 use std::time::Duration;
