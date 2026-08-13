@@ -42,6 +42,11 @@ impl Handle {
         CURRENT.with(|c| c.borrow().clone())
     }
 
+    /// Whether this handle belongs to a current-thread runtime.
+    pub fn is_current_thread(&self) -> bool {
+        matches!(self.scheduler, Scheduler::Current(_))
+    }
+
     pub fn spawn<F>(&self, future: F) -> JoinHandle<F::Output>
     where
         F: Future + Send + 'static,

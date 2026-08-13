@@ -501,16 +501,16 @@
 
 ## Phase 16 — Macros (10 tasks)
 
-- [ ] 🔴 `eddy-macros` proc-macro crate
-- [ ] 🔴 `#[eddy::main]` — wraps `fn main` in `Runtime::new().block_on(...)`
-- [ ] 🔴 `#[eddy::main(flavor = "current_thread")]`, `worker_threads = N`
-- [ ] 🔴 `#[eddy::test]` — same, for tests, defaulting to current-thread
-- [ ] 🔴 `#[eddy::test(start_paused = true)]` for deterministic timer tests
-- [ ] 🔴 `select!` macro: random branch order, `biased`, `else`, per-branch `if` guards
-- [ ] 🔴 `join!` / `try_join!` macros
-- [ ] 🔴 Preserve spans so errors point at user code, not macro internals
-- [ ] 🔴 `trybuild` UI tests for macro error messages
-- [ ] 🟡 Test: macro-generated code compiles under `#![deny(warnings)]`
+- [x] 🔴 `eddy-macros` proc-macro crate
+- [x] 🔴 `#[eddy::main]` — wraps `fn main` in `Runtime::new().block_on(...)`
+- [x] 🔴 `#[eddy::main(flavor = "current_thread")]`, `worker_threads = N`
+- [x] 🔴 `#[eddy::test]` — same, for tests, defaulting to current-thread
+- [x] 🔴 `#[eddy::test(start_paused = true)]` for deterministic timer tests
+- [x] 🔴 `select!` macro: random branch order, `biased`, `else`, per-branch `if` guards
+- [x] 🔴 `join!` / `try_join!` macros
+- [x] 🔴 Preserve spans so errors point at user code, not macro internals
+- [x] 🔴 `trybuild` UI tests for macro error messages
+- [x] 🟡 Test: macro-generated code compiles under `#![deny(warnings)]`
 
 ---
 

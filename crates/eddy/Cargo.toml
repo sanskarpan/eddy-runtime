@@ -5,6 +5,7 @@ edition = "2021"
 rust-version = "1.80"
 
 [dependencies]
+eddy-macros = { path = "../eddy-macros" }
 libc = "0.2"
 slab = "0.4"
 parking_lot = "0.12"

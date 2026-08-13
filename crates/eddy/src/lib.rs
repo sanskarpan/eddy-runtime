@@ -20,3 +20,5 @@ pub mod time;
 pub use cancellation::CancellationToken;
 pub use runtime::{Builder, Handle, Runtime};
 pub use task::{AbortHandle, JoinError, JoinHandle};
+
+pub use eddy_macros::{main, test};
