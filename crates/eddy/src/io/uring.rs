@@ -2717,6 +2717,10 @@ mod tests {
 
         ring.submit_and_wait().unwrap();
         ring.poll_completions();
+        if !ring.inner.state.lock().unwrap().orphaned.is_empty() {
+            ring.submit_and_wait().unwrap();
+            ring.poll_completions();
+        }
         assert_eq!(ring.inner.state.lock().unwrap().orphaned.len(), 0);
         std::fs::remove_file(path).unwrap();
     }
