@@ -114,6 +114,23 @@ unsafe fn drop_waker(ptr: *const ()) {
     RawTask::from_raw(header).drop_reference();
 }
 
+fn noop_clone(ptr: *const ()) -> RawWaker {
+    RawWaker::new(ptr, &NOOP_VTABLE)
+}
+fn noop_wake(_: *const ()) {}
+fn noop_wake_by_ref(_: *const ()) {}
+fn noop_drop(_: *const ()) {}
+
+static NOOP_VTABLE: RawWakerVTable =
+    RawWakerVTable::new(noop_clone, noop_wake, noop_wake_by_ref, noop_drop);
+
+/// A waker that ignores every wake. Used by tests and by combinators that
+/// need a dummy context.
+pub fn noop_waker() -> Waker {
+    // SAFETY: the vtable never dereferences the data pointer.
+    unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &NOOP_VTABLE)) }
+}
+
 #[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;

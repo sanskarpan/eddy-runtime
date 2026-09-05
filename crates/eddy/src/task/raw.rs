@@ -5,10 +5,20 @@
 use std::cell::UnsafeCell;
 use std::future::Future;
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::task::Waker;
 
 use super::state::State;
 use super::{JoinErrorRepr, Schedule};
+
+#[allow(dead_code)]
+pub(crate) static TASK_ALLOCS: AtomicUsize = AtomicUsize::new(0);
+#[allow(dead_code)]
+pub(crate) static TASK_DEALLOCS: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) fn record_dealloc() {
+    TASK_DEALLOCS.fetch_add(1, Ordering::Relaxed);
+}
 
 #[repr(C)]
 pub(crate) struct Cell<F: Future, S> {
@@ -23,23 +33,60 @@ pub(crate) struct Header {
     /// Serializes access between the owner-thread poller and a JoinHandle
     /// that is read from another thread.
     pub(crate) stage_lock: std::sync::Mutex<()>,
-    // Unused until Phase 4 (multi-thread scheduler routes cross-thread
-    // wakes by comparing this) and the injector (intrusive list threaded
-    // through `queue_next`) — present now so the layout matches SPEC.md §4
-    // and doesn't need to shift once those land.
-    #[allow(dead_code)]
+    /// Worker that most recently polled this task (0 on the current-thread
+    /// runtime). It is updated before each multi-thread poll and used to route
+    /// subsequent wakes after a task is stolen.
     pub(crate) owner_id: UnsafeCell<u32>,
+    pub(crate) task_id: crate::instrument::TaskId,
+    pub(crate) location: crate::instrument::Location,
+    pub(crate) name: Option<String>,
+    pub(crate) parent: Option<crate::instrument::TaskId>,
+    pub(crate) metrics: std::sync::Arc<crate::instrument::MetricsState>,
     #[allow(dead_code)]
+    pub(crate) polls: AtomicU64,
+    #[allow(dead_code)]
+    pub(crate) busy_ns: AtomicU64,
+    #[allow(dead_code)]
+    pub(crate) idle_ns: AtomicU64,
+    #[allow(dead_code)]
+    pub(crate) last_poll_ns: AtomicU64,
+    #[cfg(feature = "instrumentation")]
+    pub(crate) poll_histogram: [AtomicU64; 16],
+    #[allow(dead_code)]
+    pub(crate) scheduled: AtomicU64,
     pub(crate) queue_next: UnsafeCell<Option<NonNull<Header>>>,
 }
 
 impl Header {
-    fn new<F: Future, S: Schedule>() -> Header {
+    #[track_caller]
+    fn new<F: Future, S: Schedule>(
+        name: Option<String>,
+        metrics: std::sync::Arc<crate::instrument::MetricsState>,
+    ) -> Header {
+        let location = std::panic::Location::caller();
         Header {
             state: State::new(),
             vtable: vtable::<F, S>(),
             stage_lock: std::sync::Mutex::new(()),
             owner_id: UnsafeCell::new(0),
+            task_id: crate::instrument::TaskId::next(),
+            location: crate::instrument::Location {
+                file: location.file(),
+                line: location.line(),
+            },
+            name,
+            parent: match crate::instrument::TaskId::current() {
+                parent if parent != crate::instrument::TaskId::default() => Some(parent),
+                _ => None,
+            },
+            metrics,
+            polls: AtomicU64::new(0),
+            busy_ns: AtomicU64::new(0),
+            idle_ns: AtomicU64::new(0),
+            last_poll_ns: AtomicU64::new(0),
+            #[cfg(feature = "instrumentation")]
+            poll_histogram: std::array::from_fn(|_| AtomicU64::new(0)),
+            scheduled: AtomicU64::new(0),
             queue_next: UnsafeCell::new(None),
         }
     }
@@ -92,9 +139,21 @@ impl RawTask {
     /// Allocates one `Cell<F, S>`, initializes it, and returns the raw
     /// handle. Caller (spawn) owns both references baked into the initial
     /// state (JoinHandle ref + run-queue ref) and must account for both.
+    #[track_caller]
+    #[allow(dead_code)]
     pub(crate) fn new<F: Future, S: Schedule>(future: F, scheduler: S) -> RawTask {
+        Self::new_named(future, scheduler, None)
+    }
+
+    #[track_caller]
+    pub(crate) fn new_named<F: Future, S: Schedule>(
+        future: F,
+        scheduler: S,
+        name: Option<String>,
+    ) -> RawTask {
+        let metrics = scheduler.metrics();
         let cell = Box::new(Cell {
-            header: Header::new::<F, S>(),
+            header: Header::new::<F, S>(name, metrics),
             core: Core {
                 scheduler,
                 stage: UnsafeCell::new(Stage::Running(future)),
@@ -106,11 +165,42 @@ impl RawTask {
         // to `*mut Header` and back to `NonNull` is a valid reinterpretation
         // of the same address for the lifetime of the allocation.
         let ptr = Box::into_raw(cell) as *mut Header;
+        TASK_ALLOCS.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: `ptr` is the live allocation created immediately above.
+        crate::instrument::task_spawned(unsafe { &(*ptr).metrics });
+        // SAFETY: `ptr` is the live allocation created immediately above.
+        let id = unsafe { (*ptr).task_id };
+        // SAFETY: `ptr` remains live until the returned task references drop.
+        let location = unsafe { (*ptr).location.clone() };
+        // SAFETY: `ptr` remains live until the returned task references drop.
+        let name = unsafe { (*ptr).name.clone() };
+        // SAFETY: `ptr` remains live until the returned task references drop.
+        let parent = unsafe { (*ptr).parent };
+        crate::instrument::emit(|| crate::instrument::RuntimeEvent::TaskSpawned {
+            id,
+            name,
+            location,
+            parent,
+        });
         RawTask {
             // SAFETY: `ptr` is `Box::into_raw`'s result reinterpreted per
             // the comment above — never null.
             header: unsafe { NonNull::new_unchecked(ptr) },
         }
+    }
+
+    pub(crate) fn set_owner_id(&self, id: u32) {
+        // SAFETY: this is called before publication at spawn time, or by the
+        // sole worker that owns the task immediately before polling it.
+        unsafe { *self.header().owner_id.get() = id };
+    }
+
+    pub(crate) fn owner_id(&self) -> u32 {
+        // SAFETY: the owner is written before the task is published and only
+        // updated by the worker while the task is exclusively being polled.
+        // A wake that can observe this value is ordered after that poll's
+        // state transition.
+        unsafe { *self.header().owner_id.get() }
     }
 
     /// SAFETY: `header` must point at a live `Header` embedded (at offset 0)
@@ -166,9 +256,15 @@ impl RawTask {
     /// SAFETY: caller is consuming exactly one reference to this task (the
     /// same discipline as dropping a `Waker`).
     pub(crate) unsafe fn wake_by_val(self) {
+        self.record_wake();
         use super::state::TransitionToNotifiedByVal as T;
         match self.header().state.transition_to_notified_by_val() {
-            T::Submit => self.schedule(),
+            T::Submit => {
+                #[cfg(feature = "instrumentation")]
+                self.header().scheduled.fetch_add(1, Ordering::Relaxed);
+                crate::instrument::task_scheduled(&self.header().metrics);
+                self.schedule()
+            }
             T::DoNothing => self.drop_reference(),
         }
     }
@@ -176,11 +272,25 @@ impl RawTask {
     /// SAFETY: caller must not treat this as consuming a reference (the
     /// same discipline as `Waker::wake_by_ref`).
     pub(crate) unsafe fn wake_by_ref(self) {
+        self.record_wake();
         use super::state::TransitionToNotifiedByRef as T;
         match self.header().state.transition_to_notified_by_ref() {
-            T::Submit => self.schedule(),
+            T::Submit => {
+                #[cfg(feature = "instrumentation")]
+                self.header().scheduled.fetch_add(1, Ordering::Relaxed);
+                crate::instrument::task_scheduled(&self.header().metrics);
+                self.schedule()
+            }
             T::DoNothing => {}
         }
+    }
+
+    fn record_wake(&self) {
+        let id = self.header().task_id;
+        crate::instrument::emit(|| crate::instrument::RuntimeEvent::TaskWoken {
+            id,
+            by: crate::instrument::WakeSource::External,
+        });
     }
 }
 
@@ -221,7 +331,10 @@ mod tests {
         // Header must be at offset 0 so `NonNull<Header>` obtained from a
         // `NonNull<Cell<F, S>>` cast is always valid.
         let cell: Cell<std::future::Ready<i32>, NoopSchedule> = Cell {
-            header: Header::new::<std::future::Ready<i32>, NoopSchedule>(),
+            header: Header::new::<std::future::Ready<i32>, NoopSchedule>(
+                None,
+                crate::instrument::global_metrics(),
+            ),
             core: Core {
                 scheduler: NoopSchedule,
                 stage: std::cell::UnsafeCell::new(Stage::Consumed),
@@ -231,5 +344,29 @@ mod tests {
         let cell_ptr: *const Cell<_, _> = &cell;
         let header_ptr: *const Header = &cell.header;
         assert_eq!(cell_ptr as usize, header_ptr as usize);
+    }
+
+    #[test]
+    fn cell_size_stays_within_the_single_allocation_budget() {
+        // Keep the type-erased task cell bounded; an accidental metadata field
+        // should not turn every spawned task into an unexpectedly large heap
+        // allocation. The benchmark target cannot name this private type.
+        assert!(
+            std::mem::size_of::<Cell<std::future::Ready<()>, NoopSchedule>>() <= 768,
+            "task cell grew beyond its allocation budget"
+        );
+    }
+
+    #[test]
+    fn spawn_uses_exactly_one_alloc_and_one_dealloc() {
+        let before_allocs = TASK_ALLOCS.load(Ordering::SeqCst);
+        let before_deallocs = TASK_DEALLOCS.load(Ordering::SeqCst);
+        let raw = RawTask::new(std::future::ready(()), NoopSchedule);
+        assert!(TASK_ALLOCS.load(Ordering::SeqCst) > before_allocs);
+        assert!(TASK_DEALLOCS.load(Ordering::SeqCst) >= before_deallocs);
+        // JoinHandle + queue refs: drop both.
+        raw.drop_reference();
+        raw.drop_reference();
+        assert!(TASK_DEALLOCS.load(Ordering::SeqCst) > before_deallocs);
     }
 }

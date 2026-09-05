@@ -306,13 +306,15 @@ impl<A: Future, B: Future> Select2Guarded<A, B> {
     }
 
     /// Disables the `a` branch after its value failed the `select!` pattern.
-    pub fn disable_a(&mut self) {
-        self.a_enabled = false;
+    pub fn disable_a(self: Pin<&mut Self>) {
+        let this = self.project();
+        *this.a_enabled = false;
     }
 
     /// Disables the `b` branch after its value failed the `select!` pattern.
-    pub fn disable_b(&mut self) {
-        self.b_enabled = false;
+    pub fn disable_b(self: Pin<&mut Self>) {
+        let this = self.project();
+        *this.b_enabled = false;
     }
 }
 
@@ -401,11 +403,7 @@ impl Future for YieldNow {
     }
 }
 
-/// Wait for two or three futures, resolving with all of their outputs.
-///
-/// L9: unlike `std::future::join!` this is not variadic — it supports only 2
-/// or 3 arguments. Nest additional futures (`join!(join!(a, b, c), d)`) for
-/// more, at the cost of one extra layer of awaits.
+/// Wait for two or more futures, resolving with all of their outputs.
 #[macro_export]
 macro_rules! join {
     ($a:expr, $b:expr $(,)?) => {
@@ -417,11 +415,31 @@ macro_rules! join {
             (a, b, c)
         }
     };
+    ($a:expr, $b:expr, $c:expr, $d:expr $(,)?) => {
+        async {
+            let ((a, b), (c, d)) =
+                $crate::future::join2($crate::future::join2($a, $b), $crate::future::join2($c, $d))
+                    .await;
+            (a, b, c, d)
+        }
+    };
+    ($a:expr, $b:expr, $c:expr, $d:expr, $e:expr $(,)?) => {
+        async {
+            let ((a, b, c, d), e) = $crate::future::join2($crate::join!($a, $b, $c, $d), $e).await;
+            (a, b, c, d, e)
+        }
+    };
+    ($a:expr, $b:expr, $c:expr, $d:expr, $e:expr, $f:expr $(,)?) => {
+        async {
+            let ((a, b, c), (d, e, f)) =
+                $crate::future::join2($crate::join!($a, $b, $c), $crate::join!($d, $e, $f)).await;
+            (a, b, c, d, e, f)
+        }
+    };
 }
 
-/// Wait for two or three `Result` futures, resolving with the first error
-/// (short-circuiting) or the tuple of outputs. Supports only 2 or 3
-/// arguments (L9); nest or use `select!` for larger sets.
+/// Wait for two or more `Result` futures, resolving with the first error
+/// (short-circuiting) or the tuple of outputs.
 #[macro_export]
 macro_rules! try_join {
     ($a:expr, $b:expr $(,)?) => {
@@ -430,10 +448,23 @@ macro_rules! try_join {
     ($a:expr, $b:expr, $c:expr $(,)?) => {
         $crate::future::try_join3($a, $b, $c)
     };
+    ($a:expr, $b:expr, $c:expr, $d:expr $(,)?) => {
+        async {
+            match $crate::future::try_join2(
+                $crate::future::try_join2($a, $b),
+                $crate::future::try_join2($c, $d),
+            )
+            .await
+            {
+                Ok(((a, b), (c, d))) => Ok((a, b, c, d)),
+                Err(e) => Err(e),
+            }
+        }
+    };
 }
 
-/// Wait for one of two branches to complete, running the first branch whose
-/// future completes (like `std::future::select!`, limited to two branches).
+/// Wait for one of the branches to complete, running the first branch whose
+/// future completes (Tokio-shaped `select!`; 1–3 branches).
 ///
 /// Each branch may carry an optional `, if <precondition>` guard: the
 /// precondition is evaluated once when `select!` is entered, and a `false`
@@ -500,14 +531,6 @@ macro_rules! select {
             $else)
     };
     ($a:pat = $afut:expr $(, if $acond:expr)? => $aout:expr,
-     $b:pat = $bfut:expr $(, if $bcond:expr)? => $bout:expr $(,)?) => {
-        $crate::select!(@internal
-            false;
-            $a = $afut $(, if $acond)? => $aout,
-            $b = $bfut $(, if $bcond)? => $bout;
-            ::core::panic!("all branches are disabled and there is no else branch"))
-    };
-    ($a:pat = $afut:expr $(, if $acond:expr)? => $aout:expr,
      $b:pat = $bfut:expr $(, if $bcond:expr)? => $bout:expr,
      else => $else:expr $(,)?) => {
         $crate::select!(@internal
@@ -516,23 +539,45 @@ macro_rules! select {
             $b = $bfut $(, if $bcond)? => $bout;
             $else)
     };
+    ($a:pat = $afut:expr $(, if $acond:expr)? => $aout:expr,
+     $b:pat = $bfut:expr $(, if $bcond:expr)? => $bout:expr,
+     $c:pat = $cfut:expr $(, if $ccond:expr)? => $cout:expr $(,)?) => {
+        $crate::select! {
+            $a = $afut $(, if $acond)? => $aout,
+            __eddy_rest = async {
+                $crate::select! {
+                    $b = $bfut $(, if $bcond)? => $bout,
+                    $c = $cfut $(, if $ccond)? => $cout,
+                }
+            } => __eddy_rest,
+        }
+    };
+    ($a:pat = $afut:expr $(, if $acond:expr)? => $aout:expr,
+     $b:pat = $bfut:expr $(, if $bcond:expr)? => $bout:expr $(,)?) => {
+        $crate::select!(@internal
+            false;
+            $a = $afut $(, if $acond)? => $aout,
+            $b = $bfut $(, if $bcond)? => $bout;
+            ::core::panic!("all branches are disabled and there is no else branch"))
+    };
     (@internal $biased:literal;
      $a:pat = $afut:expr $(, if $acond:expr)? => $aout:expr,
      $b:pat = $bfut:expr $(, if $bcond:expr)? => $bout:expr;
      $fallback:expr) => {{
         let __eddy_a_enabled = true $(&& ($acond))?;
         let __eddy_b_enabled = true $(&& ($bcond))?;
-        let mut __eddy_select = $crate::future::Select2Guarded::new(
+        let __eddy_select = $crate::future::Select2Guarded::new(
             $afut,
             __eddy_a_enabled,
             $bfut,
             __eddy_b_enabled,
             $biased,
         );
+        let mut __eddy_select = ::std::pin::pin!(__eddy_select);
         let __eddy_output = $crate::future::poll_fn(|__eddy_cx| {
             loop {
                 match ::std::future::Future::poll(
-                    ::std::pin::Pin::new(&mut __eddy_select),
+                    __eddy_select.as_mut(),
                     __eddy_cx,
                 ) {
                     ::std::task::Poll::Pending => {
@@ -549,7 +594,7 @@ macro_rules! select {
                         match &__eddy_value {
                             $a => {}
                             _ => {
-                                __eddy_select.disable_a();
+                                __eddy_select.as_mut().disable_a();
                                 continue;
                             }
                         }
@@ -565,7 +610,7 @@ macro_rules! select {
                         match &__eddy_value {
                             $b => {}
                             _ => {
-                                __eddy_select.disable_b();
+                                __eddy_select.as_mut().disable_b();
                                 continue;
                             }
                         }

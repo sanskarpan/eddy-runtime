@@ -13,12 +13,17 @@ mod waker;
 pub(crate) use raw::{Header, RawTask};
 
 pub use join::{AbortHandle, JoinError, JoinHandle};
+pub use waker::noop_waker;
 
 /// Implemented by every scheduler a task can run on. `schedule` is called
 /// with a reference-carrying `Notified<S>` any time the task transitions
 /// from idle to needing a poll (initial spawn, or a wake with `Submit`).
 pub(crate) trait Schedule: Sized + Sync + 'static {
     fn schedule(&self, task: Notified<Self>);
+
+    fn metrics(&self) -> std::sync::Arc<crate::instrument::MetricsState> {
+        crate::instrument::global_metrics()
+    }
 
     /// Defer destruction of a task to the scheduler's owning thread. This is
     /// required for current-thread tasks whose future may be `!Send`.
@@ -126,12 +131,26 @@ pub(crate) enum JoinErrorRepr {
 /// already accounts for the run-queue reference, so routing it through
 /// `transition_to_notified_*` here would incorrectly try to take a second
 /// one.
+#[track_caller]
 pub(crate) fn spawn<F, S>(future: F, scheduler: S) -> (Notified<S>, JoinHandle<F::Output>)
 where
     F: Future + 'static,
     S: Schedule,
 {
-    let raw = RawTask::new(future, scheduler);
+    spawn_with_name(future, scheduler, None)
+}
+
+#[track_caller]
+pub(crate) fn spawn_with_name<F, S>(
+    future: F,
+    scheduler: S,
+    name: Option<String>,
+) -> (Notified<S>, JoinHandle<F::Output>)
+where
+    F: Future + 'static,
+    S: Schedule,
+{
+    let raw = RawTask::new_named(future, scheduler, name);
     let handle = JoinHandle::new(raw);
     (Notified::new(raw), handle)
 }

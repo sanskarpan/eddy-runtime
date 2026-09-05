@@ -1,19 +1,11 @@
 error: expected a boolean literal for `start_paused`
- --> tests/ui/bad_paused.rs:3:29
+ --> tests/ui/bad_paused.rs:1:29
   |
-3 | #[eddy::test(start_paused = "yes")]
+1 | #[eddy::test(start_paused = "yes")]
   |                             ^^^^^
 
-warning: unused import: `eddy_macros::test`
- --> tests/ui/bad_paused.rs:1:5
-  |
-1 | use eddy_macros::test;
-  |     ^^^^^^^^^^^^^^^^^
-  |
-  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
-
 error[E0601]: `main` function not found in crate `$CRATE`
- --> tests/ui/bad_paused.rs:6:2
+ --> tests/ui/bad_paused.rs:4:2
   |
-6 | }
+4 | }
   |  ^ consider adding a `main` function to `$DIR/tests/ui/bad_paused.rs`

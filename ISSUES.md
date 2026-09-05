@@ -5,11 +5,14 @@ item is verified against the source with a concrete interleaving or failure
 trace. Items are fixed in order: C1 → C2 → H1+H2 → H3 → M1–M6 → L-items →
 checklist/test hygiene.
 
-**Status: all items fixed, tested, and committed in `e3ae620`** (clippy
-`-D warnings` clean, `cargo fmt` applied, loom suite 17/17, full suite green).
-L4 is the only exception: the proposed drain loop cannot be implemented in a
-one-stream-per-call `accept()` API (see L4 below) and was reverted after
-verification.
+**Status: all items fixed and covered by tests.** The original hardening landed
+in `e3ae620`; the remaining L4/L7 items were subsequently completed. The
+workspace is clippy-clean, formatted, and the loom and full test suites pass.
+
+The follow-up audit also closed two non-runtime findings: `Header::owner_id` is
+now updated before each multi-thread poll and routes wakes after task stealing,
+and guarded `select!` mutation uses the safe `pin-project` projection instead
+of bypassing pinned access with `get_unchecked_mut`.
 H4 (below) was found later during Phase 8/9 feature work (async broadcast/watch
 tests were the first to sleep in a spawned task on the current-thread runtime).
 
@@ -36,11 +39,11 @@ resource leak) · **L** = low (robustness / ergonomics).
 | L4 | Low | `io/net.rs` accept path | One connection accepted per event instead of draining |
 | L5 | Low | `io/unix.rs` | `UnixDatagram::shutdown` surfaces `ENOTCONN` to callers |
 | L6 | Low | `io/buf.rs` | Vectored I/O count not clamped to `IOV_MAX` |
-| L7 | Low | `time/wheel.rs` | Timers can fire ~1 ms early (wheel granularity, accepted tradeoff) |
+| L7 | Low | `time/wheel.rs` | Timer wheel bucket boundaries could be mistaken for exact deadlines |
 | L8 | Low | `queue.rs:82-99` | `push_overflow` busy-spins while all slots are claimed-but-uncommitted |
 | L9 | Low | `future.rs:240-267` | `join!` / `try_join!` support only 2–3 args, not variadic |
 | L10 | Low | `worker.rs:792-803` | `take_injected` pushes into a full local queue then re-pushes to the injector |
-| L11 | Low | `CHECKLIST.md` | Phases 5 & 6 fully implemented but still marked `[ ]`; summary arithmetic stale |
+| L11 | Low | `CHECKLIST.md` | Historical checklist status/count drift |
 
 ---
 
@@ -69,9 +72,10 @@ queue.rs:59 must never admit a push whose wrap target lies inside the
 claimed-but-uncommitted region `[real_head, steal_head)`.
 
 **Fix plan.**
-1. `push_back`: use `steal_head` for the capacity check —
-   `tail.wrapping_sub(steal_head) as usize >= CAP` rejects exactly when the
-   push slot would wrap into claimed territory.
+1. `push_back`: retain the committed-head capacity check. Because
+   `tail - real_head` includes claimed-but-uncommitted slots, it conservatively
+   rejects pushes until those slots are committed and can never overwrite a
+   thief's in-flight read.
 2. `commit_real_head`: commit claims **in order** — a thief CASes `real_head`
    from its claim's start (`steal_head` observed at claim time) to its
    `claimed_end`; if another claim is still ahead, retry until the earlier
@@ -411,21 +415,21 @@ completes (must hang on current code).
   workers block in `park_worker`, never in `thread::park()`; the baton does
   nothing. Fix: route through `io.unpark_worker(id)` (clears the bit, wakes the
   driver/condvar). H1's fix is a prerequisite for the wake to be reliable.
-- **L4 Accept drains one connection per event** (`io/net.rs`): level-triggered
-  polling re-reports, so it is correct but slow under bursts. **Not fixed —
-  reverted as unimplementable**: a drain loop was attempted and clippy's
-  `never_loop` proved it cannot iterate — `accept()` returns on the first
-  successful `accept(2)`, so draining would require buffering connections,
-  which the one-stream-per-call API forbids. The per-connection wake cost is
-  one extra poller return per connection on the same event; accepted.
+- **L4 Accept drains one connection per event** (`io/net.rs`): fixed by draining
+  the listener to `WouldBlock` after each readiness event and retaining extra
+  accepted `(TcpStream, SocketAddr)` values in a shared pending queue. The
+  public one-stream-per-call API is preserved without paying one poller turn
+  per connection in a burst.
 - **L5 `UnixDatagram::shutdown` → `ENOTCONN`** (`io/unix.rs`): surface the
   error correctly or treat unconnected datagram shutdown as a no-op.
 - **L6 iovec count unclamped**: `writev`/`readv` with more than `IOV_MAX` io
   vecs fails with `EINVAL`. Fix: clamp. Implemented in
   `TcpStream::poll_write_vectored` (`io/net.rs:652-656`) via `.take(...)` —
   this crate only exposes vectored writes on `TcpStream`.
-- **L7 Timers can fire ~1 ms early** (`time/wheel.rs`): accepted wheel
-  tradeoff; document it next to the wheel math.
+- **L7 Timer bucket boundary treated as a deadline** (`time/wheel.rs`): fixed by
+  checking each entry's exact deadline against the supplied clock before moving
+  it to the pending list. Bucket boundaries can wake the driver early, but a
+  timer is never externally completed early.
 - **L8 `push_overflow` busy-spins** (`queue.rs:82-99`): when every slot is
   claimed-but-uncommitted, `push_back`/`steal_into` both fail and the loop
   spins until a thief commits. Fix: bounded retry with a yield/backoff
@@ -472,9 +476,8 @@ completes (must hang on current code).
 
 ## Checklist hygiene (L11)
 
-- `CHECKLIST.md` Phase 5 (I/O Driver) and Phase 6 (Timer Wheel): every task is
-  implemented (sys poller, registration, driver loop, wheel, sleep/timeout)
-  yet still marked `[ ]` — flip to `[x]` per item.
-- The Summary table's "TOTAL 396" counts all checkboxes; per-phase entry counts
-  already disagree with the phase headers (e.g. Phase 1 lists 30 entries for 28
-  tasks). Fix the arithmetic or the headers.
+- Resolved: Phase 5 and Phase 6 entries are synchronized with their
+  implementation and marked `[x]`.
+- Resolved: all phase headers match their checkbox counts and the summary total
+  is 405. The remaining unchecked entries are intentionally unimplemented work
+  in Phases 12-15, 17, and 18.

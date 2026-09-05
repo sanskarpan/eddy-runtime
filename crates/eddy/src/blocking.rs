@@ -40,6 +40,7 @@ struct Inner {
     max_threads: usize,
     keep_alive: Duration,
     threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
+    metrics: Arc<crate::instrument::MetricsState>,
 }
 
 struct QueueState {
@@ -49,7 +50,11 @@ struct QueueState {
 }
 
 impl BlockingPool {
-    pub(crate) fn new(max_threads: usize, keep_alive: Duration) -> BlockingPool {
+    pub(crate) fn new_with_metrics(
+        max_threads: usize,
+        keep_alive: Duration,
+        metrics: Arc<crate::instrument::MetricsState>,
+    ) -> BlockingPool {
         BlockingPool {
             inner: Arc::new(Inner {
                 queue: Mutex::new(QueueState {
@@ -62,6 +67,7 @@ impl BlockingPool {
                 max_threads,
                 keep_alive,
                 threads: Mutex::new(Vec::new()),
+                metrics,
             }),
         }
     }
@@ -77,6 +83,8 @@ impl BlockingPool {
             return;
         }
         state.jobs.push_back(task);
+        crate::instrument::task_scheduled(&self.inner.metrics);
+        crate::instrument::task_queued(&self.inner.metrics);
         let spawn = state.idle == 0
             && self.inner.num_threads.load(Ordering::Relaxed) < self.inner.max_threads;
         if spawn {
@@ -110,6 +118,7 @@ impl BlockingPool {
             std::mem::take(&mut state.jobs)
         };
         for task in queued {
+            crate::instrument::task_dequeued(&self.inner.metrics);
             cancel_task(task);
         }
         self.inner.condvar.notify_all();
@@ -131,6 +140,10 @@ impl Schedule for BlockingPool {
 
     fn can_dealloc_remotely(&self) -> bool {
         true
+    }
+
+    fn metrics(&self) -> Arc<crate::instrument::MetricsState> {
+        self.inner.metrics.clone()
     }
 }
 
@@ -162,7 +175,10 @@ fn thread_loop(pool: Arc<Inner>) {
             // A thread that woke from the wait already removed its own idle
             // count; a freshly spawned thread was never counted at all.
             drop(state);
+            let started = std::time::Instant::now();
+            crate::instrument::task_dequeued(&pool.metrics);
             job.run();
+            crate::instrument::worker_busy(&pool.metrics, started.elapsed());
             continue;
         }
         if pool.closed.load(Ordering::Acquire) {

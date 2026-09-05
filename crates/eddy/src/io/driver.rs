@@ -10,7 +10,7 @@
 use std::io;
 use std::pin::Pin;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
@@ -38,6 +38,8 @@ const CONDVAR_PARK_TIMEOUT: Duration = Duration::from_millis(1);
 pub(crate) struct ScheduledIo {
     packed: AtomicU64,
     waiters: Mutex<Waiters>,
+    slab_index: AtomicUsize,
+    fd: AtomicI64,
 }
 
 struct Waiters {
@@ -56,6 +58,7 @@ struct Waiters {
 pub(crate) struct Waiter {
     waker: Waker,
     interests: Interest,
+    task: crate::instrument::TaskId,
     links: Pointers<Waiter>,
 }
 
@@ -133,15 +136,21 @@ unsafe fn from_raw(ptr: NonNull<Waiter>) -> Arc<Waiter> {
 }
 
 impl ScheduledIo {
-    fn new(generation: u32) -> ScheduledIo {
+    fn new(generation: u32, fd: Fd) -> ScheduledIo {
         ScheduledIo {
             packed: AtomicU64::new((generation as u64) << GEN_SHIFT),
             waiters: Mutex::new(Waiters::new()),
+            slab_index: AtomicUsize::new(usize::MAX),
+            fd: AtomicI64::new(fd as i64),
         }
     }
 
     fn generation(&self) -> u32 {
         (self.packed.load(Ordering::Relaxed) >> GEN_SHIFT) as u32
+    }
+
+    fn fd(&self) -> i32 {
+        self.fd.load(Ordering::Relaxed) as i32
     }
 
     /// Check whether `interest` is currently satisfied, without waiting.
@@ -173,7 +182,7 @@ impl ScheduledIo {
     /// Set readiness bits and wake matching waiters. The bits are stored while
     /// holding the waiters lock so a waiter that registers under the same
     /// lock can never miss an event set after its registration.
-    fn set_readiness_and_wake(&self, ready: Ready) {
+    fn set_readiness_and_wake(&self, ready: Ready) -> Vec<crate::instrument::TaskId> {
         let mut waiters = self.waiters.lock().unwrap();
         let packed = self.packed.load(Ordering::Relaxed);
         let ready_bits = ((packed & READY_MASK) >> READY_SHIFT) as u16 | ready.bits();
@@ -182,10 +191,13 @@ impl ScheduledIo {
             Ordering::Release,
         );
         let mut popped = Vec::new();
+        let mut woke = Vec::new();
         if let Some(waiter) = take_matching(&mut waiters.reader, ready) {
+            woke.push(waiter.task);
             popped.push(waiter);
         }
         if let Some(waiter) = take_matching(&mut waiters.writer, ready) {
+            woke.push(waiter.task);
             popped.push(waiter);
         }
         // Preserve overflow waiters whose interests were not reported.
@@ -197,6 +209,7 @@ impl ScheduledIo {
             // SAFETY: `node` is a leaked reference owned by the list.
             let waiter = unsafe { from_raw(node) };
             if interest_satisfied(waiter.interests, ready) {
+                woke.push(waiter.task);
                 popped.push(waiter);
             } else {
                 // SAFETY: `waiter` remains live and detached from the list.
@@ -207,6 +220,7 @@ impl ScheduledIo {
         for waiter in popped {
             waiter.waker.wake_by_ref();
         }
+        woke
     }
 
     /// Clear the bits reported by a `ReadyEvent`. Generation-guarded so a
@@ -264,6 +278,7 @@ impl ScheduledIo {
         let waiter = Arc::new(Waiter {
             waker,
             interests: interest,
+            task: crate::instrument::TaskId::current(),
             links: Pointers::new(),
         });
         if interest.is_readable() && waiters.reader.is_none() {
@@ -447,6 +462,7 @@ pub(crate) struct DriverShared {
     events: Mutex<Vec<Event>>,
     park: Mutex<ParkState>,
     park_condvar: Condvar,
+    wake_pending: AtomicBool,
     timer: Arc<TimerShared>,
 }
 
@@ -471,9 +487,9 @@ impl DriverShared {
             let weak = weak.clone();
             let notify = Arc::new(move || {
                 if let Some(driver) = weak.upgrade() {
-                    let result = driver.poller.wake();
-                    debug_assert!(result.is_ok(), "eddy: driver wake failed: {result:?}");
-                    let _ = result;
+                    if let Err(error) = driver.poller.wake() {
+                        tracing::warn!(?error, "eddy: driver wake failed");
+                    }
                 }
             });
             DriverShared {
@@ -486,6 +502,7 @@ impl DriverShared {
                     waiters: 0,
                 }),
                 park_condvar: Condvar::new(),
+                wake_pending: AtomicBool::new(false),
                 timer: TimerShared::new(notify),
             }
         }))
@@ -495,17 +512,43 @@ impl DriverShared {
     pub(crate) fn register(&self, fd: Fd, interest: Interest) -> io::Result<Arc<ScheduledIo>> {
         set_nonblocking(fd)?;
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
-        let scheduled = Arc::new(ScheduledIo::new(generation));
+        let scheduled = Arc::new(ScheduledIo::new(generation, fd));
         let index = {
             let mut slab = self.slab.lock().unwrap();
             slab.insert(scheduled.clone())
         };
+        scheduled.slab_index.store(index, Ordering::Release);
         let token = Token::new(index, generation);
         if let Err(error) = self.poller.register(fd, token, interest) {
+            scheduled.slab_index.store(usize::MAX, Ordering::Release);
             self.slab.lock().unwrap().remove(index);
             return Err(error);
         }
         Ok(scheduled)
+    }
+
+    /// Rearm an edge-triggered registration after its owner has attempted an
+    /// operation. The generation check keeps a late operation from touching a
+    /// slab slot that has already been reused.
+    pub(crate) fn reregister(
+        &self,
+        scheduled: &ScheduledIo,
+        fd: Fd,
+        interest: Interest,
+    ) -> io::Result<()> {
+        let index = scheduled.slab_index.load(Ordering::Acquire);
+        if index == usize::MAX {
+            return Ok(());
+        }
+        let slab = self.slab.lock().unwrap();
+        if !slab
+            .get(index)
+            .is_some_and(|entry| std::ptr::eq(entry.as_ref(), scheduled))
+        {
+            return Ok(());
+        }
+        self.poller
+            .reregister(fd, Token::new(index, scheduled.generation()), interest)
     }
 
     /// Deregister an fd (called from `Registration::drop`). A stale event
@@ -514,11 +557,14 @@ impl DriverShared {
     /// different generation.
     pub(crate) fn deregister(&self, scheduled: &ScheduledIo, fd: Fd) {
         let _ = self.poller.deregister(fd);
+        let index = scheduled.slab_index.swap(usize::MAX, Ordering::AcqRel);
+        if index == usize::MAX {
+            return;
+        }
         let mut slab = self.slab.lock().unwrap();
-        if let Some(index) = slab
-            .iter()
-            .find(|(_, entry)| std::ptr::eq(entry.as_ref(), scheduled))
-            .map(|(index, _)| index)
+        if slab
+            .get(index)
+            .is_some_and(|entry| std::ptr::eq(entry.as_ref(), scheduled))
         {
             slab.remove(index);
         }
@@ -536,11 +582,19 @@ impl DriverShared {
                 // Paused time: never block in the kernel; advance the clock
                 // to the next timer deadline instead. The worker loop
                 // re-checks its queues after park returns.
+                self.wake_pending.store(false, Ordering::Release);
                 self.timer.paused_advance();
             } else {
+                // If a wake arrived before we claimed the holder, do not
+                // block: drain with a zero timeout (H1).
+                let timeout = if self.wake_pending.swap(false, Ordering::AcqRel) {
+                    Some(Duration::ZERO)
+                } else {
+                    self.timer.next_timeout()
+                };
                 let events = {
                     let mut buffer = self.events.lock().unwrap();
-                    let _ = self.poller.wait(&mut buffer, self.timer.next_timeout());
+                    let _ = self.poller.wait(&mut buffer, timeout);
                     std::mem::take(&mut *buffer)
                 };
                 self.timer.advance_to_now();
@@ -570,6 +624,7 @@ impl DriverShared {
     /// driver at all. The injector is shared, so interrupting whichever
     /// worker holds the kernel wait — or a condvar sleeper — is sufficient.
     pub(crate) fn unpark_worker(&self, id: usize) {
+        self.wake_pending.store(true, Ordering::Release);
         let state = self.park.lock().unwrap();
         if state.waiters > 0 {
             drop(state);
@@ -581,19 +636,20 @@ impl DriverShared {
             // window where the target parks outside the driver.
             let _ = id;
             drop(state);
-            let result = self.poller.wake();
-            debug_assert!(result.is_ok(), "eddy: driver wake failed: {result:?}");
-            let _ = result;
+            if let Err(error) = self.poller.wake() {
+                tracing::warn!(?error, "eddy: driver wake failed");
+            }
         }
     }
 
     /// Wake every parked worker (shutdown path): the condvar sleepers and
     /// the kernel wait of the driver holder.
     pub(crate) fn unpark_all(&self) {
+        self.wake_pending.store(true, Ordering::Release);
         self.park_condvar.notify_all();
-        let result = self.poller.wake();
-        debug_assert!(result.is_ok(), "eddy: driver wake failed: {result:?}");
-        let _ = result;
+        if let Err(error) = self.poller.wake() {
+            tracing::warn!(?error, "eddy: driver wake failed");
+        }
     }
 
     pub(crate) fn timer_driver(&self) -> Arc<TimerShared> {
@@ -611,7 +667,22 @@ impl DriverShared {
                 // A stale event for an fd whose slab slot was reused.
                 continue;
             }
-            scheduled.set_readiness_and_wake(event.ready);
+            let woke = scheduled.set_readiness_and_wake(event.ready);
+            crate::instrument::emit(|| crate::instrument::RuntimeEvent::IoReady {
+                fd: scheduled.fd(),
+                readiness: if event.ready.is_readable() && event.ready.is_writable() {
+                    "readable|writable"
+                } else if event.ready.is_readable() {
+                    "readable"
+                } else if event.ready.is_writable() {
+                    "writable"
+                } else if event.ready.is_error() {
+                    "error"
+                } else {
+                    "closed"
+                },
+                woke,
+            });
         }
     }
 }
@@ -622,7 +693,7 @@ mod tests {
 
     #[test]
     fn clear_ready_does_not_consume_a_freshly_reported_event() {
-        let scheduled = Arc::new(ScheduledIo::new(7));
+        let scheduled = Arc::new(ScheduledIo::new(7, 0));
         scheduled.set_readiness_and_wake(Ready::READABLE);
         let event = scheduled
             .readiness(Interest::READABLE)
@@ -639,5 +710,88 @@ mod tests {
         stale.clear_ready();
         assert!(scheduled.readiness(Interest::WRITABLE).is_none());
         assert!(scheduled.readiness(Interest::READABLE).is_none());
+    }
+}
+
+#[cfg(all(test, loom))]
+mod loom_tests {
+    use super::*;
+    use std::future::Future;
+    use std::mem;
+    use std::task::{RawWaker, RawWakerVTable, Waker};
+
+    struct WakeCount(loom::sync::atomic::AtomicUsize);
+
+    unsafe fn clone_waker(data: *const ()) -> RawWaker {
+        // SAFETY: every pointer passed to this vtable is an Arc allocation
+        // created by `counting_waker` or this function.
+        let current = unsafe { loom::sync::Arc::from_raw(data as *const WakeCount) };
+        let cloned = current.clone();
+        mem::forget(current);
+        RawWaker::new(loom::sync::Arc::into_raw(cloned) as *const (), &WAKE_VTABLE)
+    }
+
+    unsafe fn wake(data: *const ()) {
+        // SAFETY: this call consumes the Arc reference owned by the waker.
+        let count = unsafe { loom::sync::Arc::from_raw(data as *const WakeCount) };
+        count.0.fetch_add(1, loom::sync::atomic::Ordering::SeqCst);
+    }
+
+    unsafe fn wake_by_ref(data: *const ()) {
+        // SAFETY: the waker keeps this Arc alive for the duration of the call.
+        let count = unsafe { &*(data as *const WakeCount) };
+        count.0.fetch_add(1, loom::sync::atomic::Ordering::SeqCst);
+    }
+
+    unsafe fn drop_waker(data: *const ()) {
+        // SAFETY: this call consumes the Arc reference owned by the waker.
+        drop(unsafe { loom::sync::Arc::from_raw(data as *const WakeCount) });
+    }
+
+    static WAKE_VTABLE: RawWakerVTable =
+        RawWakerVTable::new(clone_waker, wake, wake_by_ref, drop_waker);
+
+    fn counting_waker(count: loom::sync::Arc<WakeCount>) -> Waker {
+        // SAFETY: `WAKE_VTABLE` matches the Arc data pointer and owns one Arc
+        // reference until the resulting Waker is dropped.
+        unsafe {
+            Waker::from_raw(RawWaker::new(
+                loom::sync::Arc::into_raw(count) as *const (),
+                &WAKE_VTABLE,
+            ))
+        }
+    }
+
+    #[test]
+    fn readiness_registration_racing_with_dispatch_never_loses_a_wake() {
+        loom::model(|| {
+            let scheduled = Arc::new(ScheduledIo::new(1, 0));
+            let dispatch_scheduled = scheduled.clone();
+            let wakes = loom::sync::Arc::new(WakeCount(loom::sync::atomic::AtomicUsize::new(0)));
+            let waker = counting_waker(wakes.clone());
+            let mut readiness = Readiness::new(scheduled, Interest::READABLE);
+            let dispatch = loom::thread::spawn(move || {
+                dispatch_scheduled.set_readiness_and_wake(Ready::READABLE);
+            });
+
+            let first = Pin::new(&mut readiness).poll(&mut Context::from_waker(&waker));
+            dispatch.join().unwrap();
+
+            match first {
+                Poll::Ready(event) => {
+                    assert!(event.ready().is_readable());
+                    assert_eq!(wakes.0.load(loom::sync::atomic::Ordering::SeqCst), 0);
+                }
+                Poll::Pending => {
+                    assert_eq!(
+                        wakes.0.load(loom::sync::atomic::Ordering::SeqCst),
+                        1,
+                        "registered readiness waiter was not woken"
+                    );
+                    let second = Pin::new(&mut readiness).poll(&mut Context::from_waker(&waker));
+                    assert!(matches!(second, Poll::Ready(event) if event.ready().is_readable()));
+                }
+            }
+        });
     }
 }

@@ -96,6 +96,9 @@ struct Shared {
     idle: IdleState,
     lifo_slot_enabled: bool,
     hooks: WorkerHooks,
+    shutdown_cvar: Condvar,
+    shutdown_wait: Mutex<()>,
+    metrics: Arc<crate::instrument::MetricsState>,
 }
 
 // SAFETY: `WorkerShared` owns the only interior-mutable local queues and all
@@ -131,10 +134,27 @@ impl IdleState {
         if let Some(hook) = &shared.hooks.on_thread_park {
             hook();
         }
+        #[cfg(feature = "instrumentation")]
+        crate::instrument::emit(|| crate::instrument::RuntimeEvent::QueueDepth {
+            worker: id as u32,
+            // SAFETY: this worker owns its local queue.
+            local: unsafe { (*shared.workers[id].queue.get()).len() },
+            global: shared.inject.len(),
+            lifo: LIFO_SLOT.with(|slot| slot.borrow().is_some()),
+        });
+        crate::instrument::worker_parked(&shared.metrics);
+        crate::instrument::emit(|| crate::instrument::RuntimeEvent::WorkerPark {
+            worker: id as u32,
+            timeout: None,
+        });
         shared.io.park_worker(id);
         if let Some(hook) = &shared.hooks.on_thread_unpark {
             hook();
         }
+        crate::instrument::emit(|| crate::instrument::RuntimeEvent::WorkerUnpark {
+            worker: id as u32,
+            reason: crate::instrument::UnparkReason::Event,
+        });
         self.parked.fetch_and(!(1 << id), Ordering::SeqCst);
     }
 
@@ -183,6 +203,7 @@ impl MultiThread {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn new(worker_threads: usize) -> MultiThread {
         MultiThread::new_with_options(MultiThreadOptions {
             worker_threads,
@@ -203,6 +224,7 @@ impl MultiThread {
             "eddy: failed to start the I/O driver: ensure the runtime thread supports \
                      the platform's readiness backend",
         );
+        let metrics = crate::instrument::MetricsState::new(worker_threads);
         let shared = Arc::new(Shared {
             workers,
             inject: Injector::new(),
@@ -210,13 +232,20 @@ impl MultiThread {
             shutdown: AtomicBool::new(false),
             tasks: Mutex::new(Vec::new()),
             threads: Mutex::new(Vec::new()),
-            blocking: BlockingPool::new(options.max_blocking_threads, options.keep_alive),
+            blocking: BlockingPool::new_with_metrics(
+                options.max_blocking_threads,
+                options.keep_alive,
+                metrics.clone(),
+            ),
             next_worker: AtomicUsize::new(0),
             steal_count: AtomicUsize::new(0),
             searching: AtomicUsize::new(0),
             idle: IdleState::new(worker_threads),
             lifo_slot_enabled: options.lifo_slot,
             hooks: WorkerHooks::from_options(&options),
+            shutdown_cvar: Condvar::new(),
+            shutdown_wait: Mutex::new(()),
+            metrics,
         });
 
         for id in 0..worker_threads {
@@ -239,7 +268,17 @@ impl MultiThread {
         MultiThread { shared }
     }
 
+    #[track_caller]
     pub(crate) fn spawn<F>(&self, future: F) -> JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.spawn_named(future, None)
+    }
+
+    #[track_caller]
+    pub(crate) fn spawn_named<F>(&self, future: F, name: Option<String>) -> JoinHandle<F::Output>
     where
         F: Future + Send + 'static,
         F::Output: Send + 'static,
@@ -257,8 +296,10 @@ impl MultiThread {
             shared: self.shared.clone(),
             target,
         };
-        let (notified, handle) = task::spawn(future, scheduler.clone());
+        let (notified, handle) = task::spawn_with_name(future, scheduler.clone(), name);
+        notified.raw.set_owner_id(target as u32);
         scheduler.register_task(notified.raw);
+        crate::instrument::task_scheduled(&self.shared.metrics);
         scheduler.schedule(notified);
         handle
     }
@@ -365,20 +406,25 @@ impl MultiThread {
         self.unpark_all();
         let threads = std::mem::take(&mut *self.shared.threads.lock().unwrap());
         let deadline = Instant::now() + timeout;
-        for (id, thread) in threads.into_iter().enumerate() {
-            if !self.shared.workers[id].finished.load(Ordering::Acquire)
-                && Instant::now() < deadline
+        {
+            let mut guard = self.shared.shutdown_wait.lock().unwrap();
+            while Instant::now() < deadline
+                && self
+                    .shared
+                    .workers
+                    .iter()
+                    .any(|worker| !worker.finished.load(Ordering::Acquire))
             {
-                loop {
-                    if self.shared.workers[id].finished.load(Ordering::Acquire) {
-                        break;
-                    }
-                    if Instant::now() >= deadline {
-                        break;
-                    }
-                    thread::sleep(Duration::from_millis(1));
-                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let (g, _) = self
+                    .shared
+                    .shutdown_cvar
+                    .wait_timeout(guard, remaining)
+                    .unwrap();
+                guard = g;
             }
+        }
+        for (id, thread) in threads.into_iter().enumerate() {
             if self.shared.workers[id].finished.load(Ordering::Acquire) {
                 thread.join().expect("eddy: worker thread panicked");
             }
@@ -415,6 +461,16 @@ impl MultiThread {
     pub(crate) fn timer_driver(&self) -> Arc<TimerShared> {
         self.shared.io.timer_driver()
     }
+
+    pub(crate) fn metrics(&self) -> crate::instrument::RuntimeMetrics {
+        let shared = self.shared.clone();
+        crate::instrument::RuntimeMetrics::from_state(
+            shared.metrics.clone(),
+            Some(Arc::new(move || {
+                crate::instrument::snapshot_tasks(&shared.tasks.lock().unwrap())
+            })),
+        )
+    }
 }
 
 impl Schedule for MultiThreadHandle {
@@ -424,7 +480,16 @@ impl Schedule for MultiThreadHandle {
             return;
         }
 
-        let on_target = WORKER_ID.with(|id| id.get() == Some(self.target));
+        // A task may be stolen. Route subsequent wakes to the worker that
+        // most recently polled it instead of retaining its original target;
+        // this makes Header::owner_id the source of truth for task affinity.
+        let owner = task.raw.owner_id() as usize;
+        let target = if owner < self.shared.workers.len() {
+            owner
+        } else {
+            self.target
+        };
+        let on_target = WORKER_ID.with(|id| id.get() == Some(target));
         if on_target {
             let mut task = Some(task);
             if self.shared.lifo_slot_enabled {
@@ -438,24 +503,27 @@ impl Schedule for MultiThreadHandle {
                     }
                 });
                 if placed_in_lifo {
+                    crate::instrument::task_queued(&self.shared.metrics);
                     return;
                 }
             }
             let task = task.expect("eddy: task lost while placing in LIFO slot");
             // SAFETY: `on_target` proves this worker thread owns the queue;
             // no other thread can hold a mutable reference to it.
-            let queue = unsafe { &mut *self.shared.workers[self.target].queue.get() };
+            let queue = unsafe { &mut *self.shared.workers[target].queue.get() };
             if let Err(task) = queue.push_back(task) {
                 // Full: move the older half to the injector, keep `task`
                 // local (see `push_overflow` for why not the reverse).
                 let mut overflow = Vec::new();
                 queue.push_overflow(task, &mut overflow);
                 self.shared.inject.push_batch(overflow);
-                self.unpark_target();
+                self.unpark_target(target);
             }
+            crate::instrument::task_queued(&self.shared.metrics);
         } else {
             self.shared.inject.push(task);
-            self.unpark_target();
+            crate::instrument::task_queued(&self.shared.metrics);
+            self.unpark_target(target);
         }
     }
 
@@ -484,17 +552,21 @@ impl Schedule for MultiThreadHandle {
         task.header().state.ref_inc();
         self.shared.tasks.lock().unwrap().push(task);
     }
+
+    fn metrics(&self) -> Arc<crate::instrument::MetricsState> {
+        self.shared.metrics.clone()
+    }
 }
 
 impl MultiThreadHandle {
-    fn unpark_target(&self) {
+    fn unpark_target(&self, target: usize) {
         // Workers park in the driver's `park_worker` (kernel readiness wait
         // or condvar), never in `thread::park()`, so the driver signal is
         // the only wake that matters: it interrupts the kernel wait when the
         // target is the driver holder, the condvar notify wakes it when it
         // is a condvar sleeper, and `unpark_worker` additionally covers the
         // window where the target has claimed neither yet.
-        self.shared.io.unpark_worker(self.target);
+        self.shared.io.unpark_worker(target);
     }
 }
 
@@ -522,7 +594,7 @@ fn worker_loop(shared: Arc<Shared>, id: usize, takeover: Option<Arc<Takeover>>) 
 
     loop {
         if let Some(task) = next_lifo(&mut lifo_polls) {
-            task.run();
+            run_task(task, id);
             continue;
         }
 
@@ -531,7 +603,7 @@ fn worker_loop(shared: Arc<Shared>, id: usize, takeover: Option<Arc<Takeover>>) 
         let task = unsafe { &mut *shared.workers[id].queue.get() }.pop();
         if let Some(task) = task {
             lifo_polls = 0;
-            task.run();
+            run_task(task, id);
             continue;
         }
 
@@ -539,20 +611,21 @@ fn worker_loop(shared: Arc<Shared>, id: usize, takeover: Option<Arc<Takeover>>) 
         let global_first = tick % GLOBAL_QUEUE_INTERVAL == 0;
         if global_first {
             if let Some(task) = take_injected(&shared, id) {
-                task.run();
+                run_task(task, id);
                 continue;
             }
         }
 
         if let Some(task) = search_and_steal(&shared, id, &mut rand) {
             shared.steal_count.fetch_add(1, Ordering::Relaxed);
-            task.run();
+            crate::instrument::worker_stolen(&shared.metrics, 1);
+            run_task(task, id);
             continue;
         }
 
         if !global_first {
             if let Some(task) = take_injected(&shared, id) {
-                task.run();
+                run_task(task, id);
                 continue;
             }
         }
@@ -563,7 +636,7 @@ fn worker_loop(shared: Arc<Shared>, id: usize, takeover: Option<Arc<Takeover>>) 
         if shared.shutdown.load(Ordering::Acquire) || takeover_requested {
             // SAFETY: this worker owns queue `id`; reading it here can only
             // race with the owner's own operations.
-            let local_empty = unsafe { (&*shared.workers[id].queue.get()).len() == 0 };
+            let local_empty = unsafe { (*shared.workers[id].queue.get()).len() == 0 };
             let lifo_empty = LIFO_SLOT.with(|slot| slot.borrow().is_none());
             // A takeover thread hands back early; the returning worker picks
             // up whatever remains in the shared injector itself.
@@ -582,11 +655,21 @@ fn worker_loop(shared: Arc<Shared>, id: usize, takeover: Option<Arc<Takeover>>) 
         }
         None => {
             shared.workers[id].finished.store(true, Ordering::Release);
+            shared.shutdown_cvar.notify_all();
             if let Some(hook) = &shared.hooks.on_thread_stop {
                 hook();
             }
         }
     }
+}
+
+fn run_task(task: Notified<MultiThreadHandle>, owner_id: usize) {
+    let metrics = task.raw.header().metrics.clone();
+    task.raw.set_owner_id(owner_id as u32);
+    crate::instrument::task_dequeued(&metrics);
+    let started = Instant::now();
+    task.run();
+    crate::instrument::worker_busy(&metrics, started.elapsed());
 }
 
 /// The thread that services worker `id`'s queues while the worker itself
@@ -752,7 +835,7 @@ fn has_work(shared: &Shared, id: usize) -> bool {
         return true;
     }
     // SAFETY: this worker owns queue `id`.
-    unsafe { (&*shared.workers[id].queue.get()).len() > 0 }
+    unsafe { (*shared.workers[id].queue.get()).len() > 0 }
 }
 
 /// Try to steal work, honoring the searching cap: at most half the workers
@@ -835,6 +918,11 @@ fn steal_work(
         // task into it without aliasing any other live reference.
         let destination = unsafe { &mut *shared.workers[id].queue.get() };
         if let Some(task) = source.steal_into(destination) {
+            crate::instrument::emit(|| crate::instrument::RuntimeEvent::WorkerSteal {
+                thief: id as u32,
+                victim: victim as u32,
+                count: 1,
+            });
             return Some(task);
         }
     }

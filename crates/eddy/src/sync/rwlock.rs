@@ -79,8 +79,31 @@ fn wake_waiter(waiter: &Arc<Waiter>) {
     }
 }
 
+fn wake_readers_locked(state: &mut State) {
+    while let Some(waiter) = state.queue.front() {
+        if waiter.kind != WaitKind::Reader {
+            break;
+        }
+        let waiter = state.queue.pop_front().unwrap();
+        state.readers += 1;
+        waiter.granted.store(true, Ordering::Release);
+        wake_waiter(&waiter);
+    }
+}
+
 fn wake_next_locked(state: &mut State) {
-    if state.writer || state.readers != 0 {
+    if state.writer {
+        return;
+    }
+    if state.readers != 0 {
+        // A shared lock is held. Additional readers may join unless a writer
+        // is next in line (write-preferring). This is also the downgrade path.
+        if let Some(waiter) = state.queue.front() {
+            if waiter.kind == WaitKind::Writer {
+                return;
+            }
+        }
+        wake_readers_locked(state);
         return;
     }
     if let Some(waiter) = state.queue.front() {
@@ -93,15 +116,7 @@ fn wake_next_locked(state: &mut State) {
             return;
         }
     }
-    while let Some(waiter) = state.queue.front() {
-        if waiter.kind != WaitKind::Reader {
-            break;
-        }
-        let waiter = state.queue.pop_front().unwrap();
-        state.readers += 1;
-        waiter.granted.store(true, Ordering::Release);
-        wake_waiter(&waiter);
-    }
+    wake_readers_locked(state);
 }
 
 impl<T> RwLock<T> {
@@ -187,6 +202,9 @@ impl<'a, T: ?Sized> Future for Read<'a, T> {
     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         // SAFETY: polling does not move the pinned future allocation.
         let this = unsafe { self.get_unchecked_mut() };
+        if crate::coop::poll_proceed(cx).is_pending() {
+            return Poll::Pending;
+        }
         let mut state = this.inner.state.lock().unwrap();
         if this.waiter.granted.swap(false, Ordering::Acquire) {
             this.registered = false;
@@ -232,6 +250,9 @@ impl<'a, T: ?Sized> Future for Write<'a, T> {
     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         // SAFETY: polling does not move the pinned future allocation.
         let this = unsafe { self.get_unchecked_mut() };
+        if crate::coop::poll_proceed(cx).is_pending() {
+            return Poll::Pending;
+        }
         let mut state = this.inner.state.lock().unwrap();
         if this.waiter.granted.swap(false, Ordering::Acquire) {
             this.registered = false;
@@ -313,6 +334,7 @@ impl<'a, T: ?Sized> WriteGuard<'a, T> {
             let mut state = inner.state.lock().unwrap();
             state.writer = false;
             state.readers = 1;
+            wake_next_locked(&mut state);
         }
         ReadGuard {
             inner,

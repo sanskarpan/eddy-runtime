@@ -37,7 +37,13 @@ impl Sleep {
         self.deadline = deadline;
         self.entry.reset();
         if let Some(driver) = &self.driver {
+            let waker = self.entry.clone_waker();
             driver.cancel(&self.entry);
+            if let Some(waker) = waker {
+                if driver.arm(&self.entry, self.deadline, waker.clone()) {
+                    waker.wake();
+                }
+            }
         }
     }
 }

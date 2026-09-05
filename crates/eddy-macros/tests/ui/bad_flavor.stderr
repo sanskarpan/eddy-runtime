@@ -1,19 +1,11 @@
 error: expected `flavor = "current_thread"` or `flavor = "multi_thread"`
- --> tests/ui/bad_flavor.rs:3:23
+ --> tests/ui/bad_flavor.rs:1:23
   |
-3 | #[eddy::main(flavor = "wrong")]
+1 | #[eddy::main(flavor = "wrong")]
   |                       ^^^^^^^
 
-warning: unused import: `eddy_macros::main`
- --> tests/ui/bad_flavor.rs:1:5
-  |
-1 | use eddy_macros::main;
-  |     ^^^^^^^^^^^^^^^^^
-  |
-  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
-
 error[E0601]: `main` function not found in crate `$CRATE`
- --> tests/ui/bad_flavor.rs:6:2
+ --> tests/ui/bad_flavor.rs:4:2
   |
-6 | }
+4 | }
   |  ^ consider adding a `main` function to `$DIR/tests/ui/bad_flavor.rs`

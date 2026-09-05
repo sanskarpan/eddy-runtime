@@ -38,6 +38,7 @@ unsafe impl Sync for Waiter {}
 struct State {
     permits: usize,
     closed: bool,
+    holder: crate::instrument::TaskId,
     waiters: LinkedList<Waiter>,
 }
 
@@ -98,6 +99,7 @@ impl Future for Acquire<'_> {
         let mut state = this.inner.state.lock().unwrap();
         if this.waiter.granted {
             this.waiter.granted = false;
+            state.holder = crate::instrument::TaskId::current();
             let inner = this.inner.clone();
             return Poll::Ready(Ok(SemaphorePermit {
                 inner,
@@ -117,6 +119,7 @@ impl Future for Acquire<'_> {
             && state.permits >= this.waiter.permits
         {
             state.permits -= this.waiter.permits;
+            state.holder = crate::instrument::TaskId::current();
             return Poll::Ready(Ok(SemaphorePermit {
                 inner: this.inner.clone(),
                 permits: this.waiter.permits,
@@ -128,6 +131,12 @@ impl Future for Acquire<'_> {
             // SAFETY: the future is pinned for the duration of registration;
             // Drop removes the node before the future is moved or destroyed.
             unsafe { state.waiters.push_back(ptr) };
+            let holder = state.holder;
+            crate::instrument::emit(|| crate::instrument::RuntimeEvent::ResourceContended {
+                kind: "semaphore",
+                holder,
+                waiters: Vec::new(),
+            });
         }
         Poll::Pending
     }
@@ -192,6 +201,7 @@ fn release_locked(state: &mut State, permits: usize) -> Vec<Waker> {
         }
         state.permits -= waiter.permits;
         waiter.granted = true;
+        state.holder = crate::instrument::TaskId::current();
         if let Some(waker) = waiter.waker.take() {
             wakes.push(waker);
         }
@@ -212,6 +222,7 @@ impl Semaphore {
                 state: Mutex::new(State {
                     permits,
                     closed: false,
+                    holder: crate::instrument::TaskId::default(),
                     waiters: LinkedList::new(),
                 }),
             }),
@@ -342,6 +353,26 @@ mod loom_tests {
             assert_eq!(granted.load(LoomOrdering::Acquire), 2);
         });
     }
+
+    #[test]
+    fn close_racing_with_waiter_registration_wakes_with_an_error() {
+        let mut builder = loom::model::Builder::new();
+        builder.preemption_bound = Some(2);
+        builder.check(|| {
+            let semaphore = Arc::new(Semaphore::new(0));
+            let waiter_semaphore = semaphore.clone();
+            let waiter = loom::thread::spawn(move || {
+                let result = loom::future::block_on(waiter_semaphore.acquire());
+                assert!(result.is_err(), "a closed semaphore granted a permit");
+            });
+
+            loom::thread::yield_now();
+            semaphore.close();
+            waiter.join().unwrap();
+            assert!(semaphore.is_closed());
+            assert_eq!(semaphore.available_permits(), 0);
+        });
+    }
 }
 
 #[cfg(all(test, not(loom)))]
@@ -369,5 +400,18 @@ mod tests {
             acquire.as_mut().poll(&mut cx),
             Poll::Ready(Err(_))
         ));
+    }
+
+    #[test]
+    fn dropping_a_pending_acquire_does_not_consume_the_next_permit() {
+        let semaphore = Semaphore::new(0);
+        let mut acquire = Box::pin(semaphore.acquire());
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(acquire.as_mut().poll(&mut cx).is_pending());
+        drop(acquire);
+
+        semaphore.add_permits(1);
+        assert!(semaphore.try_acquire().is_ok());
     }
 }

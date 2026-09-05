@@ -50,7 +50,10 @@ fn epoll_events(interest: Interest) -> u32 {
         events |= libc::EPOLLOUT as u32;
     }
     if interest.is_edge_triggered() {
-        events |= libc::EPOLLET as u32;
+        // One-shot makes the drain/rearm protocol explicit. Without it, a
+        // short edge-triggered read can consume the only notification while
+        // leaving bytes in the socket.
+        events |= (libc::EPOLLET | libc::EPOLLONESHOT) as u32;
     }
     events
 }

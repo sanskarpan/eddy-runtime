@@ -83,6 +83,8 @@ impl<E: AsRawFd> PollEvented<E> {
             return Poll::Pending;
         }
         let mut waiter = self.read_waiter.lock().unwrap();
+        let edge = self.registration.is_edge_triggered();
+        let mut read_any = false;
         loop {
             let event =
                 match poll_readiness(&self.registration, &mut waiter, Interest::READABLE, cx) {
@@ -94,13 +96,27 @@ impl<E: AsRawFd> PollEvented<E> {
                 .try_io_with(Interest::READABLE, || recv_into(self.as_raw_fd(), buf))
             {
                 Ok(n) => {
-                    *waiter = None;
                     // SAFETY: recv initialized exactly the returned byte count.
                     unsafe { buf.advance(n) };
+                    read_any |= n != 0;
+                    if edge && n != 0 && buf.remaining() != 0 {
+                        // In edge mode keep consuming this readiness transition
+                        // until the caller's buffer is full or the socket says
+                        // WouldBlock. Bytes are never read past the supplied
+                        // buffer, so AsyncRead's ownership contract is intact.
+                        continue;
+                    }
+                    *waiter = None;
                     drop(event);
                     return Poll::Ready(Ok(()));
                 }
-                Err(error) if would_block(&error) => event.clear_ready(),
+                Err(error) if would_block(&error) => {
+                    event.clear_ready();
+                    if read_any {
+                        *waiter = None;
+                        return Poll::Ready(Ok(()));
+                    }
+                }
                 Err(error) => {
                     *waiter = None;
                     return Poll::Ready(Err(error));

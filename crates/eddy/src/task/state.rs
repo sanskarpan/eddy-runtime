@@ -440,3 +440,67 @@ mod tests {
         assert!(s.ref_dec()); // 0 -> last
     }
 }
+
+#[cfg(all(test, loom))]
+mod loom_tests {
+    use super::*;
+
+    #[test]
+    fn poll_wake_complete_and_abort_interleavings_have_one_terminal_state() {
+        let mut builder = loom::model::Builder::new();
+        builder.preemption_bound = Some(2);
+        builder.check(|| {
+            let state = loom::sync::Arc::new(State::new());
+            assert!(matches!(
+                state.transition_to_running(),
+                TransitionToRunning::Success
+            ));
+
+            let poll_state = state.clone();
+            let poller = loom::thread::spawn(move || {
+                // A wake may arrive while the future is returning Pending.
+                let idle = poll_state.transition_to_idle();
+                loom::thread::yield_now();
+                assert!(matches!(
+                    idle,
+                    TransitionToIdle::Ok
+                        | TransitionToIdle::OkNotified
+                        | TransitionToIdle::Cancelled
+                ));
+                poll_state.transition_to_complete();
+            });
+
+            let wake_state = state.clone();
+            let waker = loom::thread::spawn(move || {
+                loom::thread::yield_now();
+                let _ = wake_state.transition_to_notified_by_ref();
+            });
+
+            let abort_state = state.clone();
+            let aborter = loom::thread::spawn(move || {
+                loom::thread::yield_now();
+                abort_state.set_cancelled();
+            });
+
+            poller.join().unwrap();
+            waker.join().unwrap();
+            aborter.join().unwrap();
+
+            let snapshot = state.snapshot();
+            assert!(snapshot.is_complete(), "task did not reach completion");
+            assert!(!snapshot.is_running());
+            assert!(!snapshot.is_notified());
+
+            // Once completion or cancellation wins, later wakes cannot create
+            // another queue claim.
+            assert!(matches!(
+                state.transition_to_notified_by_ref(),
+                TransitionToNotifiedByRef::DoNothing
+            ));
+            assert!(matches!(
+                state.transition_to_notified_by_val(),
+                TransitionToNotifiedByVal::DoNothing
+            ));
+        });
+    }
+}

@@ -1,3 +1,9 @@
 [workspace]
 resolver = "2"
 members = ["crates/eddy", "crates/eddy-macros", "crates/eddy-console", "crates/eddy-console-web"]
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
+
+[workspace.lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ["cfg(loom)"] }

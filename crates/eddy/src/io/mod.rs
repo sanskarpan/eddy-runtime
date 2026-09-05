@@ -14,6 +14,8 @@ pub mod ops;
 pub mod poll_evented;
 #[cfg(unix)]
 pub mod unix;
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+pub mod uring;
 
 use std::io;
 use std::mem::MaybeUninit;
@@ -36,6 +38,12 @@ pub use ops::{copy, copy_bidirectional, empty, repeat, sink, Empty, Repeat, Sink
 pub use poll_evented::PollEvented;
 #[cfg(unix)]
 pub use unix::{UnixDatagram, UnixListener, UnixStream};
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+pub use uring::{
+    AcceptOwned, AsyncReadOwned, AsyncWriteOwned, CloseOwned, ConnectOwned, FixedBufferOwned,
+    FixedFileOwned, IoUring, IoUringBuilder, ReadOwned, ReadvOwned, RecvOwned, RegisteredBuffers,
+    RegisteredFiles, SendOwned, TimeoutOwned, WriteOwned, WritevOwned,
+};
 
 /// A buffer passed to [`AsyncRead::poll_read`]. It tracks bytes that have
 /// been filled separately from bytes whose memory has been initialized.
@@ -382,6 +390,19 @@ impl Registration {
         interests: Interest,
     ) -> io::Result<Registration> {
         let scheduled = driver.register(fd.as_raw_fd(), interests)?;
+        crate::instrument::emit(|| crate::instrument::RuntimeEvent::IoRegistered {
+            fd: fd.as_raw_fd(),
+            interest: if interests.is_readable() && interests.is_writable() {
+                "readable|writable"
+            } else if interests.is_readable() {
+                "readable"
+            } else if interests.is_writable() {
+                "writable"
+            } else {
+                "empty"
+            },
+            task: crate::instrument::TaskId::current(),
+        });
         // SAFETY: `fd` is an OwnedFd, so the raw fd is valid and owned.
         Ok(Registration {
             _driver: driver,
@@ -412,7 +433,14 @@ impl Registration {
         interest: Interest,
         f: impl FnOnce() -> io::Result<R>,
     ) -> io::Result<R> {
-        match f() {
+        let result = f();
+        if self.interests.is_edge_triggered() {
+            // Edge filters are one-shot. Rearm after every syscall, including
+            // WouldBlock, so a short read cannot strand a still-ready fd.
+            self._driver
+                .reregister(&self.scheduled, self.as_raw_fd(), self.interests)?;
+        }
+        match result {
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 if let Some(event) = self.scheduled.readiness(interest) {
                     event.clear_ready();
@@ -425,6 +453,10 @@ impl Registration {
 
     pub(crate) fn driver(&self) -> Arc<DriverShared> {
         self._driver.clone()
+    }
+
+    pub(crate) fn is_edge_triggered(&self) -> bool {
+        self.interests.is_edge_triggered()
     }
 }
 

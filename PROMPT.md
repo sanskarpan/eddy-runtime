@@ -7,7 +7,7 @@ Build a Tokio-class async runtime from scratch:
 - **Backend: Rust** — hand-built task allocation with a manual vtable, `RawWakerVTable` by hand, current-thread and multi-thread work-stealing schedulers (Chase-Lev deque, LIFO slot, global injector), reactor over epoll/kqueue/IOCP plus a completion-based io_uring backend, hierarchical timing wheel, async I/O types, a full set of async sync primitives, blocking pool, cooperative budget, and `tracing`-based instrumentation
 - **Frontend: ratatui TUI + React/TypeScript/Vite/Tailwind/shadcn/D3/Recharts web console** — task lifecycle swimlanes, worker/queue heatmap, wake causality graph, poll-duration histograms
 
-**Read `runtime-SPEC.md` and `runtime-CHECKLIST.md` before writing any code.**
+**Read `SPEC.md` and `CHECKLIST.md` before writing any code.**
 
 ### Four rules that override everything
 

@@ -175,6 +175,9 @@ impl<T> Receiver<T> {
     }
 
     fn poll_changed(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), RecvError>> {
+        if crate::coop::poll_proceed(cx).is_pending() {
+            return Poll::Pending;
+        }
         let mut state = self.inner.state.lock().unwrap();
         if state.version != self.version {
             // A new value arrived since the last observed version.

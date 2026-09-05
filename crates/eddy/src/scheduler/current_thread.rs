@@ -30,6 +30,7 @@ struct Inner {
     shutdown_complete: AtomicBool,
     timer: Arc<TimerShared>,
     blocking: BlockingPool,
+    metrics: Arc<crate::instrument::MetricsState>,
 }
 
 // `Inner` is plain `Send + Sync` (every field is behind a Mutex or an
@@ -54,6 +55,7 @@ impl CurrentThread {
                 thread.unpark();
             }
         }));
+        let metrics = crate::instrument::MetricsState::new(1);
         CurrentThread(Arc::new(Inner {
             local: Mutex::new(VecDeque::new()),
             injection: Mutex::new(VecDeque::new()),
@@ -66,7 +68,12 @@ impl CurrentThread {
             closed: AtomicBool::new(false),
             shutdown_complete: AtomicBool::new(false),
             timer,
-            blocking: BlockingPool::new(max_blocking_threads, keep_alive),
+            blocking: BlockingPool::new_with_metrics(
+                max_blocking_threads,
+                keep_alive,
+                metrics.clone(),
+            ),
+            metrics,
         }))
     }
 
@@ -92,6 +99,7 @@ impl CurrentThread {
         }
 
         if *owner == Some(current) && !self.0.closed.load(Ordering::Acquire) {
+            crate::instrument::task_queued(&self.0.metrics);
             self.0.local.lock().unwrap().push_back(task);
             return;
         }
@@ -104,6 +112,7 @@ impl CurrentThread {
             drop(task);
             return;
         }
+        crate::instrument::task_queued(&self.0.metrics);
         injection.push_back(task);
         drop(injection);
         self.unpark_owner();
@@ -127,7 +136,16 @@ impl CurrentThread {
         self.0.injection.lock().unwrap().pop_front()
     }
 
+    #[track_caller]
     pub(crate) fn spawn<F>(&self, future: F) -> JoinHandle<F::Output>
+    where
+        F: Future + 'static,
+    {
+        self.spawn_named(future, None)
+    }
+
+    #[track_caller]
+    pub(crate) fn spawn_named<F>(&self, future: F, name: Option<String>) -> JoinHandle<F::Output>
     where
         F: Future + 'static,
     {
@@ -135,8 +153,9 @@ impl CurrentThread {
             !self.0.closed.load(Ordering::Acquire),
             "eddy: cannot spawn on a shut down runtime"
         );
-        let (notified, handle) = task::spawn(future, self.clone());
+        let (notified, handle) = task::spawn_with_name(future, self.clone(), name);
         self.register_task(notified.raw);
+        crate::instrument::task_scheduled(&self.0.metrics);
         self.enqueue(notified);
         handle
     }
@@ -187,7 +206,7 @@ impl CurrentThread {
             }
 
             match self.next_task() {
-                Some(task) => task.run(),
+                Some(task) => run_task(task, &self.0.metrics),
                 None => {
                     self.0.timer.advance_to_now();
                     // H4: `advance_to_now` may have just fired a timer whose
@@ -207,6 +226,7 @@ impl CurrentThread {
                     if self.0.timer.paused_advance() {
                         continue;
                     }
+                    crate::instrument::worker_parked(&self.0.metrics);
                     match self.0.timer.next_timeout() {
                         Some(timeout) => std::thread::park_timeout(timeout),
                         None => std::thread::park(),
@@ -220,9 +240,19 @@ impl CurrentThread {
         self.0.timer.clone()
     }
 
+    pub(crate) fn metrics(&self) -> crate::instrument::RuntimeMetrics {
+        let scheduler = self.clone();
+        crate::instrument::RuntimeMetrics::from_state(
+            self.0.metrics.clone(),
+            Some(Arc::new(move || {
+                crate::instrument::snapshot_tasks(&scheduler.0.tasks.lock().unwrap())
+            })),
+        )
+    }
+
     fn drain_deferred(&self) {
         while let Some(task) = self.0.deferred.lock().unwrap().pop_front() {
-            task.run();
+            run_task(task, &self.0.metrics);
         }
     }
 
@@ -253,7 +283,7 @@ impl CurrentThread {
                 .or_else(|| self.0.local.lock().unwrap().pop_front())
                 .or_else(|| self.0.injection.lock().unwrap().pop_front());
             let Some(task) = task else { break };
-            task.run();
+            run_task(task, &self.0.metrics);
         }
 
         // Every registered task is now complete and its future/output has
@@ -286,6 +316,10 @@ impl Schedule for CurrentThread {
         self.unpark_owner();
     }
 
+    fn metrics(&self) -> Arc<crate::instrument::MetricsState> {
+        self.0.metrics.clone()
+    }
+
     fn is_owner_thread(&self) -> bool {
         CurrentThread::is_owner_thread(self)
     }
@@ -316,6 +350,13 @@ impl Schedule for CurrentThread {
         task.header().state.ref_inc();
         tasks.push(task);
     }
+}
+
+fn run_task(task: Notified<CurrentThread>, metrics: &crate::instrument::MetricsState) {
+    crate::instrument::task_dequeued(metrics);
+    let started = std::time::Instant::now();
+    task.run();
+    crate::instrument::worker_busy(metrics, started.elapsed());
 }
 
 struct BlockOnCleanup {

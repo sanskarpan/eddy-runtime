@@ -5,4 +5,6 @@ mod current_thread;
 mod multi_thread;
 
 pub(crate) use current_thread::CurrentThread;
+#[cfg(feature = "instrumentation")]
+pub(crate) use multi_thread::current_worker_id;
 pub(crate) use multi_thread::{MultiThread, MultiThreadHandle, MultiThreadOptions};

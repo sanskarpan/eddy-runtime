@@ -30,6 +30,32 @@ fn mutex_serializes_one_hundred_tasks() {
 }
 
 #[test]
+fn mutex_waiters_are_woken_in_fifo_order() {
+    let runtime = Builder::new_current_thread().build();
+    runtime.block_on(async {
+        let mutex = Arc::new(Mutex::new(()));
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hold = mutex.lock().await;
+        let handle = eddy::Handle::current();
+        let mut tasks = Vec::new();
+        for i in 0..16usize {
+            let mutex = mutex.clone();
+            let order = order.clone();
+            tasks.push(handle.spawn(async move {
+                let _guard = mutex.lock().await;
+                order.lock().unwrap().push(i);
+            }));
+        }
+        sleep(Duration::from_millis(5)).await;
+        drop(hold);
+        for task in tasks {
+            task.await.unwrap();
+        }
+        assert_eq!(*order.lock().unwrap(), (0..16).collect::<Vec<_>>());
+    });
+}
+
+#[test]
 fn rwlock_is_write_preferring_and_supports_downgrade() {
     let runtime = Builder::new_multi_thread().worker_threads(2).build();
     runtime.block_on(async {
@@ -48,7 +74,16 @@ fn rwlock_is_write_preferring_and_supports_downgrade() {
         drop(read);
         writer.await.unwrap();
         let write = lock.write().await;
+        let lock_for_reader = lock.clone();
+        let reader_unblocked = eddy::Handle::current().spawn(async move {
+            let _guard = lock_for_reader.read().await;
+        });
+        sleep(Duration::from_millis(5)).await;
         let read = write.downgrade();
+        timeout(Duration::from_secs(1), reader_unblocked)
+            .await
+            .expect("downgrade must wake waiting readers")
+            .unwrap();
         assert_eq!(*read, 8);
         drop(read);
 

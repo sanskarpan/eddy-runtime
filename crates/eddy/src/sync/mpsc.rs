@@ -204,6 +204,9 @@ impl<T> Future for Send<'_, T> {
         // SAFETY: polling does not move the pinned future allocation; its
         // fields are only mutated in place.
         let this = unsafe { self.get_unchecked_mut() };
+        if crate::coop::poll_proceed(cx).is_pending() {
+            return Poll::Pending;
+        }
         let mut state = this.inner.state.lock().unwrap();
         if !state.receiver_alive {
             return Poll::Ready(Err(SendError(this.item.take().unwrap())));
@@ -257,6 +260,9 @@ impl<T> Future for Reserve<'_, T> {
         // SAFETY: polling does not move the pinned future allocation; its
         // fields are only mutated in place.
         let this = unsafe { self.get_unchecked_mut() };
+        if crate::coop::poll_proceed(cx).is_pending() {
+            return Poll::Pending;
+        }
         let mut state = this.inner.state.lock().unwrap();
         if !state.receiver_alive {
             return Poll::Ready(Err(RecvError));

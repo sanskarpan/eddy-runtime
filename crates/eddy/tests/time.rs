@@ -18,6 +18,25 @@ fn sleep_wakes_on_current_thread_runtime() {
 }
 
 #[test]
+fn ten_thousand_concurrent_sleeps_complete() {
+    let runtime = Builder::new_current_thread().build();
+    runtime.block_on(async {
+        eddy::time::pause();
+        eddy::time::auto_advance(true);
+        let handle = eddy::Handle::current();
+        let mut tasks = Vec::with_capacity(10_000);
+        for _ in 0..10_000 {
+            tasks.push(handle.spawn(async {
+                sleep(Duration::from_millis(10)).await;
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+    });
+}
+
+#[test]
 fn sleep_wakes_on_multi_thread_runtime() {
     let runtime = Builder::new_multi_thread().worker_threads(2).build();
     runtime.block_on(async {
@@ -269,5 +288,35 @@ fn paused_time_delay_queue_advances_on_park() {
             .unwrap();
         assert_eq!(expired.deadline(), eddy::time::now());
         assert_eq!(expired.into_inner(), 7);
+    });
+}
+
+#[test]
+fn timer_fire_and_abort_races_are_bounded_and_terminal() {
+    let runtime = Builder::new_multi_thread().worker_threads(2).build();
+    runtime.block_on(async {
+        let handle = eddy::Handle::current();
+        timeout(Duration::from_secs(2), async {
+            for _ in 0..32 {
+                let task = handle.spawn(async {
+                    sleep(Duration::from_millis(1)).await;
+                    7u8
+                });
+                let abort = task.abort_handle();
+                let aborter = handle.spawn(async move {
+                    eddy::future::yield_now().await;
+                    abort.abort();
+                });
+                aborter.await.unwrap();
+
+                match task.await {
+                    Ok(7) | Err(eddy::JoinError::Cancelled) => {}
+                    Err(eddy::JoinError::Panic(_)) => panic!("timer task panicked"),
+                    Ok(other) => panic!("unexpected timer result: {other}"),
+                }
+            }
+        })
+        .await
+        .expect("timer fire/cancel race left a task pending");
     });
 }

@@ -9,13 +9,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use eddy::io::{
-    copy_bidirectional, AsyncReadExt, AsyncWriteExt, Interest, Registration, TcpListener, TcpStream,
+    copy_bidirectional, AsyncReadExt, AsyncWriteExt, Interest, PollEvented, Registration,
+    TcpListener, TcpStream,
 };
 use eddy::time::timeout;
 use eddy::Builder;
 
 fn socketpair() -> (OwnedFd, OwnedFd) {
     let mut fds = [0i32; 2];
+    // SAFETY: `fds` is a writable `[i32; 2]` for the kernel to fill.
     let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
     assert_eq!(rc, 0, "socketpair failed: {}", io::Error::last_os_error());
     // SAFETY: on success the kernel handed us two owned descriptors.
@@ -47,10 +49,8 @@ fn ensure_fd_limit(needed: u64) {
         rlim_max: 0,
     };
     // SAFETY: `limit` is a valid pointer to writable memory.
-    assert_eq!(
-        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
-        0
-    );
+    let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) };
+    assert_eq!(rc, 0);
     if limit.rlim_cur < needed {
         let target = needed.min(limit.rlim_max);
         assert!(
@@ -62,12 +62,9 @@ fn ensure_fd_limit(needed: u64) {
             rlim_cur: target,
             rlim_max: limit.rlim_max,
         };
-        // SAFETY: raising the soft limit up to the hard limit is always
-        // permitted; `new_limit` is a valid rlimit struct.
-        assert_eq!(
-            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &new_limit) },
-            0
-        );
+        // SAFETY: raising the soft limit up to the hard limit is permitted.
+        let rc = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &new_limit) };
+        assert_eq!(rc, 0);
     }
 }
 
@@ -237,6 +234,42 @@ fn spurious_readiness_is_cleared_and_rewait_parks() {
         write_byte(&write);
         handle.await.unwrap();
         assert!(completed.load(Ordering::SeqCst));
+    });
+}
+
+#[test]
+fn edge_triggered_reads_rearm_after_a_short_buffer() {
+    let rt = Builder::new_multi_thread().worker_threads(2).build();
+    rt.block_on(async {
+        let (read, write) = socketpair();
+        let mut stream =
+            PollEvented::new(read, Interest::READABLE.add(Interest::EDGE_TRIGGERED)).unwrap();
+        let bytes = [1u8, 2, 3];
+        // SAFETY: `write` is a live nonblocking socket and `bytes` is valid.
+        let written = unsafe {
+            libc::write(
+                write.as_raw_fd(),
+                bytes.as_ptr().cast::<libc::c_void>(),
+                bytes.len(),
+            )
+        };
+        assert_eq!(written, bytes.len() as isize);
+
+        // Each read has room for only one byte. The second and third reads
+        // prove that a short edge-triggered read rearmed the kernel filter.
+        let result = timeout(Duration::from_secs(1), async {
+            let mut got = [0u8; 1];
+            let mut all = Vec::new();
+            for _ in 0..3 {
+                let n = stream.read(&mut got).await.unwrap();
+                assert_eq!(n, 1);
+                all.push(got[0]);
+            }
+            all
+        })
+        .await
+        .unwrap();
+        assert_eq!(result, bytes);
     });
 }
 

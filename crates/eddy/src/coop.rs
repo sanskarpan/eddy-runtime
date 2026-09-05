@@ -58,7 +58,7 @@ pub fn poll_proceed(cx: &mut Context<'_>) -> Poll<()> {
         None => Poll::Ready(()),
         Some(0) => {
             cx.waker().wake_by_ref();
-            emit(RuntimeEvent::BudgetExhausted {
+            emit(|| RuntimeEvent::BudgetExhausted {
                 task: TaskId::current(),
             });
             Poll::Pending

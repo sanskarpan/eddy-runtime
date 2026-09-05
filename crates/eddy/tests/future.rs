@@ -1,10 +1,10 @@
-use std::future::Future;
+use std::future::{pending, Future};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, RawWaker, RawWakerVTable, Waker};
 use std::time::{Duration, Instant};
 
-use eddy::future::{race, ready, select2, Either};
+use eddy::future::{race, ready, Either};
 use eddy::time::{timeout, timeout_at};
 use eddy::{Builder, CancellationToken};
 
@@ -15,6 +15,7 @@ struct WakerCounts {
 }
 
 unsafe fn counting_clone(ptr: *const ()) -> RawWaker {
+    // SAFETY: `ptr` is an `Arc<WakerCounts>` produced by `into_raw`.
     let counts = unsafe { Arc::from_raw(ptr as *const WakerCounts) };
     let cloned = Arc::clone(&counts);
     counts.clones.fetch_add(1, Ordering::SeqCst);
@@ -23,17 +24,20 @@ unsafe fn counting_clone(ptr: *const ()) -> RawWaker {
 }
 
 unsafe fn counting_wake(ptr: *const ()) {
+    // SAFETY: `ptr` is an `Arc<WakerCounts>` produced by `into_raw`.
     let counts = unsafe { Arc::from_raw(ptr as *const WakerCounts) };
     counts.wakes.fetch_add(1, Ordering::SeqCst);
     std::mem::forget(counts);
 }
 
 unsafe fn counting_wake_ref(ptr: *const ()) {
+    // SAFETY: `ptr` is a live `Arc<WakerCounts>` for the duration of this call.
     let counts = unsafe { &*(ptr as *const WakerCounts) };
     counts.wakes.fetch_add(1, Ordering::SeqCst);
 }
 
 unsafe fn counting_drop(ptr: *const ()) {
+    // SAFETY: `ptr` is an `Arc<WakerCounts>` produced by `into_raw`.
     let counts = unsafe { Arc::from_raw(ptr as *const WakerCounts) };
     counts.drops.fetch_add(1, Ordering::SeqCst);
 }
@@ -149,12 +153,23 @@ fn default_select_alternates_immediately_ready_branches() {
         let mut left = 0;
         let mut right = 0;
         for _ in 0..10_000 {
-            match select2(ready(()), ready(())).await {
+            match eddy::select! {
+                a = ready(()) => Either::Left(a),
+                b = ready(()) => Either::Right(b),
+            } {
                 Either::Left(()) => left += 1,
                 Either::Right(()) => right += 1,
             }
         }
         assert!(left > 1_000 && right > 1_000);
+        let (a, b, c, d) = eddy::join!(async { 1 }, async { 2 }, async { 3 }, async { 4 }).await;
+        assert_eq!((a, b, c, d), (1, 2, 3, 4));
+        let three = eddy::select! {
+            a = ready(1) => a,
+            b = pending::<i32>() => b,
+            c = pending::<i32>() => c,
+        };
+        assert_eq!(three, 1);
     });
 }
 

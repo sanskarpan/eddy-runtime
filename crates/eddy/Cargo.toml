@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.80"
 
+[features]
+default = []
+io-uring = []
+instrumentation = []
+
 [dependencies]
 eddy-macros = { path = "../eddy-macros" }
 libc = "0.2"
@@ -34,5 +39,5 @@ path = "examples/spike.rs"
 name = "vs_tokio"
 harness = false
 
-[lints.rust]
-unexpected_cfgs = { level = "allow", check-cfg = ["cfg(loom)"] }
+[lints]
+workspace = true

@@ -1,19 +1,11 @@
 error: `worker_threads` must be a positive integer
- --> tests/ui/zero_threads.rs:3:31
+ --> tests/ui/zero_threads.rs:1:31
   |
-3 | #[eddy::main(worker_threads = 0)]
+1 | #[eddy::main(worker_threads = 0)]
   |                               ^
 
-warning: unused import: `eddy_macros::main`
- --> tests/ui/zero_threads.rs:1:5
-  |
-1 | use eddy_macros::main;
-  |     ^^^^^^^^^^^^^^^^^
-  |
-  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
-
 error[E0601]: `main` function not found in crate `$CRATE`
- --> tests/ui/zero_threads.rs:6:2
+ --> tests/ui/zero_threads.rs:4:2
   |
-6 | }
+4 | }
   |  ^ consider adding a `main` function to `$DIR/tests/ui/zero_threads.rs`

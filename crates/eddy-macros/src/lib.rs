@@ -113,7 +113,13 @@ impl Parse for AttrArgs {
 }
 
 impl AttrArgs {
-    fn builder_expr(&self, default: Flavor) -> TokenStream2 {
+    fn runtime_expr(&self, default: Flavor) -> TokenStream2 {
+        if self.flavor.is_none()
+            && self.worker_threads.is_none()
+            && matches!(default, Flavor::MultiThread)
+        {
+            return quote! { eddy::Runtime::new() };
+        }
         let flavor = match self.flavor {
             Some(Flavor::MultiThread) => quote! { eddy::Builder::new_multi_thread() },
             Some(Flavor::CurrentThread) => quote! { eddy::Builder::new_current_thread() },
@@ -122,10 +128,11 @@ impl AttrArgs {
                 Flavor::CurrentThread => quote! { eddy::Builder::new_current_thread() },
             },
         };
-        match (self.worker_threads, self.start_paused) {
-            (Some(n), _) => quote! { #flavor.worker_threads(#n) },
-            _ => flavor,
-        }
+        let builder = match self.worker_threads {
+            Some(n) => quote! { #flavor.worker_threads(#n) },
+            None => flavor,
+        };
+        quote! { #builder.build() }
     }
 }
 
@@ -135,17 +142,6 @@ fn validate_item(item: &ItemFn, kind: &str) -> syn::Result<()> {
             item.sig.generics.span(),
             format!("#[{kind}] cannot be applied to a generic function"),
         ));
-    }
-    if item.sig.asyncness.is_some() {
-        if let Some(async_token) = &item.sig.asyncness {
-            return Err(Error::new(
-                async_token.span(),
-                format!(
-                    "#[{kind}] cannot be applied to `async fn`; write a synchronous \
-                     function and `.await` inside it"
-                ),
-            ));
-        }
     }
     Ok(())
 }
@@ -178,13 +174,23 @@ pub fn main(args: TokenStream, input: TokenStream) -> TokenStream {
 
     let attrs = carry_attrs(&item);
     let stmts = &item.block.stmts;
-    let builder = args.builder_expr(Flavor::MultiThread);
+    let runtime = args.runtime_expr(Flavor::MultiThread);
+    let paused = args.start_paused.unwrap_or(false);
+    let pause = if paused {
+        quote! {
+            eddy::time::pause();
+            eddy::time::auto_advance(true);
+        }
+    } else {
+        quote! {}
+    };
 
     let expanded = quote! {
         #(#attrs)*
         fn main() {
-            let rt = #builder.build();
+            let rt = #runtime;
             rt.block_on(async {
+                #pause
                 #(#stmts)*
             });
         }
@@ -213,7 +219,7 @@ pub fn test(args: TokenStream, input: TokenStream) -> TokenStream {
     let attrs = carry_attrs(&item);
     let ident = &item.sig.ident;
     let stmts = &item.block.stmts;
-    let builder = args.builder_expr(Flavor::CurrentThread);
+    let runtime = args.runtime_expr(Flavor::CurrentThread);
     let paused = args.start_paused.unwrap_or(false);
 
     let expanded = if paused {
@@ -221,7 +227,7 @@ pub fn test(args: TokenStream, input: TokenStream) -> TokenStream {
             #(#attrs)*
             #[test]
             fn #ident() {
-                let rt = #builder.build();
+                let rt = #runtime;
                 rt.block_on(async {
                     eddy::time::pause();
                     eddy::time::auto_advance(true);
@@ -234,7 +240,7 @@ pub fn test(args: TokenStream, input: TokenStream) -> TokenStream {
             #(#attrs)*
             #[test]
             fn #ident() {
-                let rt = #builder.build();
+                let rt = #runtime;
                 rt.block_on(async {
                     #(#stmts)*
                 });

@@ -11,6 +11,11 @@ proc-macro2 = "1"
 quote = "1"
 syn = { version = "2", features = ["full"] }
 
+[lints]
+workspace = true
+
 [dev-dependencies]
 eddy = { path = "../eddy" }
-trybuild = "1"
+# Pinned: trybuild 1.0.120+ requires rustc 1.88; eddy MSRV is 1.80 and the
+# Homebrew rustc on this machine is 1.87.
+trybuild = "=1.0.105"

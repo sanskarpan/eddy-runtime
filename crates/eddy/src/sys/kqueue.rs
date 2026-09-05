@@ -41,7 +41,8 @@ fn kevent_error() -> io::Error {
 fn build_kevent(filter: i16, fd: RawFd, token: Token, interest: Interest) -> libc::kevent {
     let mut flags = libc::EV_ADD | libc::EV_ENABLE;
     if interest.is_edge_triggered() {
-        flags |= libc::EV_CLEAR;
+        // EV_ONESHOT pairs with Registration's rearm-after-syscall protocol.
+        flags |= libc::EV_CLEAR | libc::EV_ONESHOT;
     }
     libc::kevent {
         ident: fd as libc::uintptr_t,

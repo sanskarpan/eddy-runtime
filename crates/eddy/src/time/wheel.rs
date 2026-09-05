@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::task::Waker;
 use std::time::{Duration, Instant};
 
+use crate::instrument;
 use crate::util::{Linked, LinkedList, Pointers};
 
 pub(crate) const LEVEL_COUNT: usize = 6;
@@ -19,6 +20,7 @@ const UNLINKED_LEVEL: u8 = u8::MAX;
 /// One timer node. The wheel owns one leaked `Arc` reference while this node
 /// is linked; the future that is waiting owns another reference.
 pub(crate) struct TimerEntry {
+    id: u64,
     deadline: AtomicU64,
     fired: AtomicBool,
     level: AtomicU8,
@@ -28,8 +30,14 @@ pub(crate) struct TimerEntry {
 }
 
 impl TimerEntry {
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
     pub(crate) fn new() -> Arc<TimerEntry> {
+        static NEXT_TIMER_ID: AtomicU64 = AtomicU64::new(1);
         Arc::new(TimerEntry {
+            id: NEXT_TIMER_ID.fetch_add(1, Ordering::Relaxed),
             deadline: AtomicU64::new(0),
             fired: AtomicBool::new(false),
             level: AtomicU8::new(UNLINKED_LEVEL),
@@ -45,6 +53,10 @@ impl TimerEntry {
 
     pub(crate) fn reset(&self) {
         self.fired.store(false, Ordering::Release);
+    }
+
+    pub(crate) fn clone_waker(&self) -> Option<Waker> {
+        self.waker.lock().unwrap().clone()
     }
 }
 
@@ -91,12 +103,11 @@ impl Level {
 /// Hierarchical hashed timing wheel. `elapsed` is milliseconds since the
 /// associated `TimerShared` was created.
 ///
-/// Time is bucketed per level, so a timer lands in the slot of its rounded
-/// bucket and can fire up to ~1 ms before its true deadline (L7): when
-/// `insert`'s slot arithmetic rounds `when` down, `advance_to` reaches the
-/// slot's representative instant one millisecond early. This is an accepted
-/// tradeoff of a low-resolution wheel — timers never fire late, only early
-/// within the wheel's granularity.
+/// Time is bucketed per level, so a timer may cause an early driver wake at a
+/// bucket boundary. `advance_to` compares every candidate's exact deadline to
+/// the supplied clock before moving it to `pending`; the public timer therefore
+/// never fires early. The extra wake is the bounded cost of the low-resolution
+/// wheel.
 pub(crate) struct Wheel {
     pub(crate) elapsed: u64,
     levels: Box<[Level; LEVEL_COUNT]>,
@@ -262,7 +273,7 @@ impl Wheel {
             let slot = (self.elapsed & SLOT_MASK) as usize;
             if self.levels[0].occupied & (1u64 << slot) != 0 {
                 for entry in self.take_slot(0, slot) {
-                    if entry.deadline.load(Ordering::Acquire) <= self.elapsed {
+                    if entry.deadline.load(Ordering::Acquire) <= now {
                         entry.level.store(PENDING_LEVEL, Ordering::Release);
                         // SAFETY: the entry is detached and the pending list
                         // takes one Arc reference.
@@ -376,12 +387,18 @@ impl TimerShared {
 
     pub(crate) fn arm(&self, entry: &Arc<TimerEntry>, deadline: Instant, waker: Waker) -> bool {
         let already_due = deadline <= self.now_instant();
+        let deadline_instant = deadline;
         let deadline = self.instant_to_ms(deadline);
         let mut wheel = self.wheel.lock().unwrap();
         wheel.remove(entry);
         entry.deadline.store(deadline, Ordering::Release);
         entry.fired.store(false, Ordering::Release);
         *entry.waker.lock().unwrap() = Some(waker);
+        instrument::emit(|| instrument::RuntimeEvent::TimerSet {
+            id: entry.id(),
+            deadline: deadline_instant,
+            task: instrument::TaskId::current(),
+        });
         if already_due || deadline <= wheel.elapsed {
             entry.fired.store(true, Ordering::Release);
             entry.waker.lock().unwrap().take();
@@ -398,6 +415,7 @@ impl TimerShared {
         let mut wheel = self.wheel.lock().unwrap();
         wheel.remove(entry);
         entry.waker.lock().unwrap().take();
+        instrument::emit(|| instrument::RuntimeEvent::TimerCancelled { id: entry.id() });
     }
 
     pub(crate) fn advance_to_now(&self) {
@@ -406,13 +424,22 @@ impl TimerShared {
         wheel.advance_to(now);
         let entries = wheel.take_pending();
         let mut wakers = Vec::new();
+        let mut fired = Vec::new();
         for entry in entries {
             entry.fired.store(true, Ordering::Release);
+            let deadline = entry.deadline.load(Ordering::Acquire);
+            fired.push((entry.id(), now.saturating_sub(deadline)));
             if let Some(waker) = entry.waker.lock().unwrap().take() {
                 wakers.push(waker);
             }
         }
         drop(wheel);
+        for (id, lateness) in fired {
+            instrument::emit(|| instrument::RuntimeEvent::TimerFired {
+                id,
+                lateness: Duration::from_millis(lateness),
+            });
+        }
         for waker in wakers {
             waker.wake();
         }
@@ -465,6 +492,52 @@ mod tests {
     }
 
     #[test]
+    fn one_hundred_thousand_inserts_and_cancels_complete_quickly() {
+        let mut wheel = Wheel::new();
+        let mut entries = Vec::with_capacity(100_000);
+        let started = std::time::Instant::now();
+        for i in 0..100_000u64 {
+            let item = entry(1 + (i % 50_000));
+            wheel.insert(item.clone());
+            entries.push(item);
+        }
+        for item in &entries {
+            assert!(wheel.remove(item));
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "insert+cancel of 100k timers took {elapsed:?}, expected O(1) per op"
+        );
+    }
+
+    #[test]
+    fn timers_do_not_fire_before_their_deadline() {
+        let mut wheel = Wheel::new();
+        let item = entry(10);
+        wheel.insert(item.clone());
+        wheel.advance_to(9);
+        assert!(wheel.take_pending().is_empty());
+        wheel.advance_to(10);
+        let fired = wheel.take_pending();
+        assert_eq!(fired.len(), 1);
+        assert!(Arc::ptr_eq(&fired[0], &item));
+    }
+
+    #[test]
+    fn bucket_boundary_wakes_do_not_fire_a_timer_early() {
+        let mut wheel = Wheel::new();
+        let item = entry(65);
+        wheel.insert(item.clone());
+        // Level zero's bucket boundary is an internal wake point, not the
+        // timer's exact deadline.
+        wheel.advance_to(64);
+        assert!(wheel.take_pending().is_empty());
+        wheel.advance_to(65);
+        assert_eq!(wheel.take_pending().len(), 1);
+    }
+
+    #[test]
     fn timers_fire_in_deadline_order() {
         let mut wheel = Wheel::new();
         let late = entry(30);
@@ -498,5 +571,149 @@ mod tests {
         let mut wheel = Wheel::new();
         wheel.advance_to(u64::MAX);
         assert_eq!(wheel.elapsed, u64::MAX);
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+mod property_tests {
+    use super::*;
+    use proptest::prelude::*;
+    use std::collections::HashSet;
+
+    fn entry(deadline: u64) -> Arc<TimerEntry> {
+        let entry = TimerEntry::new();
+        entry.deadline.store(deadline, Ordering::Release);
+        entry
+    }
+
+    proptest! {
+        #[test]
+        fn cancelled_entries_never_appear_in_pending(
+            deadlines in prop::collection::vec(1u64..128, 1..32),
+            cancelled in prop::collection::vec(any::<bool>(), 1..32),
+        ) {
+            let mut wheel = Wheel::new();
+            let entries: Vec<_> = deadlines.into_iter().map(entry).collect();
+            for item in &entries {
+                wheel.insert(item.clone());
+            }
+
+            let mut expected = HashSet::new();
+            for (index, item) in entries.iter().enumerate() {
+                if cancelled.get(index).copied().unwrap_or(false) {
+                    assert!(wheel.remove(item));
+                } else {
+                    expected.insert(item.id());
+                }
+            }
+
+            let mut actual = HashSet::new();
+            loop {
+                wheel.advance_to(128);
+                actual.extend(wheel.take_pending().into_iter().map(|item| item.id()));
+                if wheel.elapsed >= 128 {
+                    break;
+                }
+            }
+            prop_assert_eq!(actual, expected);
+        }
+    }
+}
+
+#[cfg(all(test, loom))]
+mod loom_tests {
+    use super::*;
+    use std::mem;
+    use std::task::{RawWaker, RawWakerVTable, Waker};
+
+    struct WakeCount(loom::sync::atomic::AtomicUsize);
+
+    unsafe fn clone_waker(data: *const ()) -> RawWaker {
+        // SAFETY: the pointer is an Arc allocation owned by this vtable.
+        let current = unsafe { loom::sync::Arc::from_raw(data as *const WakeCount) };
+        let cloned = current.clone();
+        mem::forget(current);
+        RawWaker::new(loom::sync::Arc::into_raw(cloned) as *const (), &WAKE_VTABLE)
+    }
+
+    unsafe fn wake(data: *const ()) {
+        // SAFETY: wake consumes the Arc reference represented by the waker.
+        let count = unsafe { loom::sync::Arc::from_raw(data as *const WakeCount) };
+        count.0.fetch_add(1, loom::sync::atomic::Ordering::SeqCst);
+    }
+
+    unsafe fn wake_by_ref(data: *const ()) {
+        // SAFETY: the waker keeps this allocation alive during the call.
+        let count = unsafe { &*(data as *const WakeCount) };
+        count.0.fetch_add(1, loom::sync::atomic::Ordering::SeqCst);
+    }
+
+    unsafe fn drop_waker(data: *const ()) {
+        // SAFETY: drop consumes the Arc reference represented by the waker.
+        drop(unsafe { loom::sync::Arc::from_raw(data as *const WakeCount) });
+    }
+
+    static WAKE_VTABLE: RawWakerVTable =
+        RawWakerVTable::new(clone_waker, wake, wake_by_ref, drop_waker);
+
+    fn counting_waker(count: loom::sync::Arc<WakeCount>) -> Waker {
+        // SAFETY: the vtable matches the Arc data pointer and owns one Arc ref.
+        unsafe {
+            Waker::from_raw(RawWaker::new(
+                loom::sync::Arc::into_raw(count) as *const (),
+                &WAKE_VTABLE,
+            ))
+        }
+    }
+
+    #[test]
+    fn timer_fire_racing_with_cancel_wakes_at_most_once() {
+        let mut builder = loom::model::Builder::new();
+        builder.preemption_bound = Some(2);
+        builder.check(|| {
+            let entry = TimerEntry::new();
+            let wakes = loom::sync::Arc::new(WakeCount(loom::sync::atomic::AtomicUsize::new(0)));
+            *entry.waker.lock().unwrap() = Some(counting_waker(wakes.clone()));
+
+            // The wheel itself is covered by the deterministic unit and
+            // property tests above. This model isolates the one shared
+            // ownership rule at the fire/cancel boundary: exactly one side
+            // may claim an armed entry and its waker.
+            let armed = loom::sync::Arc::new(loom::sync::Mutex::new(true));
+
+            let fire_armed = armed.clone();
+            let fire_entry = entry.clone();
+            let fire = loom::thread::spawn(move || {
+                let waker = {
+                    let mut armed = fire_armed.lock().unwrap();
+                    if *armed {
+                        *armed = false;
+                        fire_entry.fired.store(true, Ordering::Release);
+                        fire_entry.waker.lock().unwrap().take()
+                    } else {
+                        None
+                    }
+                };
+                if let Some(waker) = waker {
+                    waker.wake();
+                }
+            });
+
+            let cancel_armed = armed.clone();
+            let cancel_entry = entry.clone();
+            let cancel = loom::thread::spawn(move || {
+                let mut armed = cancel_armed.lock().unwrap();
+                if *armed {
+                    *armed = false;
+                    cancel_entry.waker.lock().unwrap().take();
+                }
+            });
+
+            fire.join().unwrap();
+            cancel.join().unwrap();
+            let count = wakes.0.load(loom::sync::atomic::Ordering::SeqCst);
+            assert!(count <= 1, "timer fired more than once");
+            assert_eq!(count, if entry.is_fired() { 1 } else { 0 });
+        });
     }
 }

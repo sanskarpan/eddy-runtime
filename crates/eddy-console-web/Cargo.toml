@@ -2,3 +2,10 @@
 name = "eddy-console-web"
 version = "0.1.0"
 edition = "2021"
+
+[lints]
+workspace = true
+
+[dependencies]
+eddy-console = { path = "../eddy-console" }
+tungstenite = "0.27"

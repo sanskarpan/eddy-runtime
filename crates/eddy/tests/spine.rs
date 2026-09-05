@@ -5,6 +5,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
+use std::time::Duration;
 
 struct DropProbe(Arc<std::sync::atomic::AtomicUsize>);
 
@@ -393,4 +394,45 @@ fn detached_non_send_output_is_dropped_before_foreign_waker_cleanup() {
         .join()
         .unwrap();
     assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[test]
+fn bounded_abort_stress_does_not_leave_tasks_stuck() {
+    let runtime = Builder::new_multi_thread().worker_threads(2).build();
+    runtime.block_on(async {
+        let handle = eddy::Handle::current();
+        let mut tasks = Vec::with_capacity(64);
+        for _ in 0..64 {
+            tasks.push(handle.spawn(std::future::pending::<()>()))
+        }
+        for task in &tasks {
+            task.abort();
+        }
+
+        eddy::time::timeout(Duration::from_secs(1), async {
+            for task in tasks {
+                assert!(matches!(task.await, Err(eddy::JoinError::Cancelled)));
+            }
+        })
+        .await
+        .expect("aborted tasks did not reach a terminal state");
+    });
+}
+
+#[test]
+fn watchdog_dump_sees_and_then_clears_a_pending_task() {
+    let runtime = Builder::new_current_thread().build();
+    let task = runtime.spawn_named("watchdog-pending", std::future::pending::<()>());
+    let snapshots = runtime.dump_tasks();
+    assert!(snapshots.iter().any(|snapshot| {
+        snapshot.name.as_deref() == Some("watchdog-pending")
+            && matches!(
+                snapshot.state,
+                eddy::TaskState::Queued | eddy::TaskState::Idle
+            )
+    }));
+
+    drop(task);
+    runtime.shutdown_timeout(Duration::ZERO);
+    assert!(runtime.dump_tasks().is_empty());
 }

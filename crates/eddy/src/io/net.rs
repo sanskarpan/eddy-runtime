@@ -1,5 +1,6 @@
 //! Readiness-backed TCP and UDP sockets.
 
+use std::collections::VecDeque;
 use std::future::Future;
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, ToSocketAddrs};
@@ -286,6 +287,9 @@ fn accept_tcp(fd: RawFd) -> io::Result<OwnedFd> {
 #[derive(Clone)]
 pub struct TcpListener {
     registration: Arc<Registration>,
+    // Drain all connections visible for one readiness event. Extra accepted
+    // streams stay here so the public API can return one connection per call.
+    pending: Arc<Mutex<VecDeque<(TcpStream, SocketAddr)>>>,
 }
 
 impl TcpListener {
@@ -294,6 +298,7 @@ impl TcpListener {
         let fd = owned_fd(listener.into_raw_fd());
         Ok(TcpListener {
             registration: Arc::new(Registration::new(fd, Interest::READABLE)?),
+            pending: Arc::new(Mutex::new(VecDeque::new())),
         })
     }
 
@@ -303,6 +308,7 @@ impl TcpListener {
                 owned_fd(listener.into_raw_fd()),
                 Interest::READABLE,
             )?),
+            pending: Arc::new(Mutex::new(VecDeque::new())),
         })
     }
 
@@ -311,22 +317,33 @@ impl TcpListener {
     }
 
     pub async fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
+        if let Some(accepted) = self.pending.lock().unwrap().pop_front() {
+            return Ok(accepted);
+        }
+
         loop {
             let event = self.registration.readiness(Interest::READABLE).await;
-            let accepted = self.registration.try_io_with(Interest::READABLE, || {
-                accept_tcp(self.registration.as_raw_fd())
-            });
-            match accepted {
-                Ok(fd) => {
-                    let peer = socket_addr_for_fd(fd.as_raw_fd(), true)?;
-                    let stream = TcpStream::from_owned_fd(fd, self.registration.driver())?;
-                    event.clear_ready();
-                    return Ok((stream, peer));
+            let mut first = None;
+            loop {
+                match self.registration.try_io_with(Interest::READABLE, || {
+                    accept_tcp(self.registration.as_raw_fd())
+                }) {
+                    Ok(fd) => {
+                        let peer = socket_addr_for_fd(fd.as_raw_fd(), true)?;
+                        let stream = TcpStream::from_owned_fd(fd, self.registration.driver())?;
+                        if first.is_none() {
+                            first = Some((stream, peer));
+                        } else {
+                            self.pending.lock().unwrap().push_back((stream, peer));
+                        }
+                    }
+                    Err(error) if would_block(&error) => break,
+                    Err(error) => return Err(error),
                 }
-                Err(error) if would_block(&error) => {
-                    event.clear_ready();
-                }
-                Err(error) => return Err(error),
+            }
+            event.clear_ready();
+            if let Some(accepted) = first {
+                return Ok(accepted);
             }
         }
     }
@@ -1156,5 +1173,27 @@ impl AsRawFd for TcpReadHalf<'_> {
 impl AsRawFd for TcpWriteHalf<'_> {
     fn as_raw_fd(&self) -> RawFd {
         self.stream.as_raw_fd()
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accept_drains_a_ready_listener_backlog() {
+        const CONNECTIONS: usize = 8;
+        let runtime = crate::Builder::new_multi_thread().worker_threads(2).build();
+        runtime.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let clients = (0..CONNECTIONS)
+                .map(|_| std::net::TcpStream::connect(address).unwrap())
+                .collect::<Vec<_>>();
+
+            let _ = listener.accept().await.unwrap();
+            assert_eq!(listener.pending.lock().unwrap().len(), CONNECTIONS - 1);
+            drop(clients);
+        });
     }
 }

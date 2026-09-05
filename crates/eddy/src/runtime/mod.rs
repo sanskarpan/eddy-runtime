@@ -47,6 +47,7 @@ impl Handle {
         matches!(self.scheduler, Scheduler::Current(_))
     }
 
+    #[track_caller]
     pub fn spawn<F>(&self, future: F) -> JoinHandle<F::Output>
     where
         F: Future + Send + 'static,
@@ -58,16 +59,45 @@ impl Handle {
         }
     }
 
+    /// Spawn a task with a name included in instrumentation events and dumps.
+    #[track_caller]
+    pub fn spawn_named<F>(&self, name: impl Into<String>, future: F) -> JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let name = name.into();
+        match &self.scheduler {
+            Scheduler::Current(scheduler) => scheduler.spawn_named(future, Some(name)),
+            Scheduler::Multi(scheduler) => scheduler.spawn_named(future, Some(name)),
+        }
+    }
+
     /// Spawn a potentially `!Send` future on a current-thread runtime.
     ///
     /// Multi-thread runtimes reject this operation because the future may be
     /// polled by any worker.
+    #[track_caller]
     pub fn spawn_local<F>(&self, future: F) -> JoinHandle<F::Output>
     where
         F: Future + 'static,
     {
         match &self.scheduler {
             Scheduler::Current(scheduler) => scheduler.spawn(future),
+            Scheduler::Multi(_) => panic!("eddy: spawn_local requires a current-thread runtime"),
+        }
+    }
+
+    /// Spawn a potentially `!Send` task with a name included in
+    /// instrumentation events and dumps.
+    #[track_caller]
+    pub fn spawn_local_named<F>(&self, name: impl Into<String>, future: F) -> JoinHandle<F::Output>
+    where
+        F: Future + 'static,
+    {
+        let name = name.into();
+        match &self.scheduler {
+            Scheduler::Current(scheduler) => scheduler.spawn_named(future, Some(name)),
             Scheduler::Multi(_) => panic!("eddy: spawn_local requires a current-thread runtime"),
         }
     }
@@ -115,6 +145,24 @@ impl Handle {
     /// Enter this handle as the ambient runtime on the current thread.
     pub fn enter(&self) -> EnterGuard {
         EnterGuard::new(self.clone())
+    }
+
+    /// Return a cheap handle for runtime-wide instrumentation counters.
+    pub fn metrics(&self) -> crate::instrument::RuntimeMetrics {
+        match &self.scheduler {
+            Scheduler::Current(scheduler) => scheduler.metrics(),
+            Scheduler::Multi(scheduler) => scheduler.metrics(),
+        }
+    }
+
+    /// Capture the currently registered tasks for this runtime.
+    pub fn task_snapshots(&self) -> Vec<crate::instrument::TaskSnapshot> {
+        self.metrics().task_snapshots()
+    }
+
+    /// Capture task state for diagnostics such as a watchdog dump.
+    pub fn dump_tasks(&self) -> Vec<crate::instrument::TaskSnapshot> {
+        self.task_snapshots()
     }
 
     pub(crate) fn from_multi(scheduler: MultiThreadHandle) -> Handle {
@@ -178,6 +226,11 @@ pub struct Runtime {
 }
 
 impl Runtime {
+    /// Multi-thread runtime with one worker per available parallelism.
+    pub fn new() -> Runtime {
+        Builder::new_multi_thread().build()
+    }
+
     pub fn block_on<F: Future>(&self, future: F) -> F::Output {
         match &self.scheduler {
             Scheduler::Current(scheduler) => scheduler.block_on(future),
@@ -185,6 +238,7 @@ impl Runtime {
         }
     }
 
+    #[track_caller]
     pub fn spawn<F>(&self, future: F) -> JoinHandle<F::Output>
     where
         F: Future + Send + 'static,
@@ -196,12 +250,41 @@ impl Runtime {
         }
     }
 
+    /// Spawn a task with a name included in instrumentation events and dumps.
+    #[track_caller]
+    pub fn spawn_named<F>(&self, name: impl Into<String>, future: F) -> JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let name = name.into();
+        match &self.scheduler {
+            Scheduler::Current(scheduler) => scheduler.spawn_named(future, Some(name)),
+            Scheduler::Multi(scheduler) => scheduler.spawn_named(future, Some(name)),
+        }
+    }
+
+    #[track_caller]
     pub fn spawn_local<F>(&self, future: F) -> JoinHandle<F::Output>
     where
         F: Future + 'static,
     {
         match &self.scheduler {
             Scheduler::Current(scheduler) => scheduler.spawn(future),
+            Scheduler::Multi(_) => panic!("eddy: spawn_local requires a current-thread runtime"),
+        }
+    }
+
+    /// Spawn a potentially `!Send` task with a name included in
+    /// instrumentation events and dumps.
+    #[track_caller]
+    pub fn spawn_local_named<F>(&self, name: impl Into<String>, future: F) -> JoinHandle<F::Output>
+    where
+        F: Future + 'static,
+    {
+        let name = name.into();
+        match &self.scheduler {
+            Scheduler::Current(scheduler) => scheduler.spawn_named(future, Some(name)),
             Scheduler::Multi(_) => panic!("eddy: spawn_local requires a current-thread runtime"),
         }
     }
@@ -242,6 +325,30 @@ impl Runtime {
             Scheduler::Current(scheduler) => scheduler.shutdown(),
             Scheduler::Multi(scheduler) => scheduler.shutdown_timeout(timeout),
         }
+    }
+
+    /// Return a cheap handle for runtime-wide instrumentation counters.
+    pub fn metrics(&self) -> crate::instrument::RuntimeMetrics {
+        match &self.scheduler {
+            Scheduler::Current(scheduler) => scheduler.metrics(),
+            Scheduler::Multi(scheduler) => scheduler.metrics(),
+        }
+    }
+
+    /// Capture the currently registered tasks for this runtime.
+    pub fn task_snapshots(&self) -> Vec<crate::instrument::TaskSnapshot> {
+        self.metrics().task_snapshots()
+    }
+
+    /// Capture task state for diagnostics such as a watchdog dump.
+    pub fn dump_tasks(&self) -> Vec<crate::instrument::TaskSnapshot> {
+        self.task_snapshots()
+    }
+}
+
+impl Default for Runtime {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

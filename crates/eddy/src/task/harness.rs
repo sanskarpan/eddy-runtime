@@ -6,6 +6,8 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::pin::Pin;
 use std::ptr::NonNull;
 use std::task::{Context, Poll, Waker};
+#[cfg(feature = "instrumentation")]
+use std::time::Instant;
 
 use super::raw::{Cell, Header, Stage};
 use super::state::{TransitionToIdle, TransitionToRunning};
@@ -53,6 +55,18 @@ pub(super) unsafe fn poll<F: Future, S: Schedule>(header: NonNull<Header>) {
     // — see `waker_ref`'s doc comment for why that distinction matters.
     let waker = waker_ref(header);
     let mut cx = Context::from_waker(&waker);
+    #[cfg(feature = "instrumentation")]
+    let poll_started = Instant::now();
+    #[cfg(feature = "instrumentation")]
+    let task_id = raw.header().task_id;
+    #[cfg(feature = "instrumentation")]
+    let worker = crate::scheduler::current_worker_id().unwrap_or(0) as u32;
+    #[cfg(feature = "instrumentation")]
+    crate::instrument::emit(|| crate::instrument::RuntimeEvent::TaskPollStart {
+        id: task_id,
+        worker,
+        at: poll_started,
+    });
 
     // SAFETY: we hold the RUNNING bit, which is the runtime's mutual-
     // exclusion guarantee that no other thread touches `stage` concurrently.
@@ -66,11 +80,57 @@ pub(super) unsafe fn poll<F: Future, S: Schedule>(header: NonNull<Header>) {
                 // is heap-allocated once and never relocated).
                 let pin = Pin::new_unchecked(fut);
                 let _budget = crate::coop::budget_guard();
+                let _task = (*cell).header.task_id.enter();
                 catch_unwind(AssertUnwindSafe(|| pin.poll(&mut cx)))
             }
             _ => unreachable!("eddy: poll called on a task not in Running stage"),
         }
     };
+
+    #[cfg(feature = "instrumentation")]
+    {
+        let duration = poll_started.elapsed();
+        let result = match &poll_result {
+            Ok(Poll::Ready(_)) => crate::instrument::PollResult::Ready,
+            Ok(Poll::Pending) => crate::instrument::PollResult::Pending,
+            Err(_) => crate::instrument::PollResult::Panicked,
+        };
+        let now = crate::instrument::monotonic_nanos();
+        let previous = raw
+            .header()
+            .last_poll_ns
+            .swap(now, std::sync::atomic::Ordering::Relaxed);
+        if previous != 0 {
+            raw.header().idle_ns.fetch_add(
+                now.saturating_sub(previous),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        raw.header()
+            .polls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        raw.header().busy_ns.fetch_add(
+            duration.as_nanos().min(u64::MAX as u128) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let bucket = duration.as_nanos().max(1).ilog2().min(15) as usize;
+        raw.header().poll_histogram[bucket].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::instrument::task_polled(&raw.header().metrics, duration);
+        crate::instrument::emit(|| crate::instrument::RuntimeEvent::TaskPollEnd {
+            id: task_id,
+            worker,
+            duration,
+            result,
+        });
+        if duration >= std::time::Duration::from_millis(100) {
+            let location = raw.header().location.clone();
+            crate::instrument::emit(|| crate::instrument::RuntimeEvent::BlockingDetected {
+                task: task_id,
+                poll_duration: duration,
+                location,
+            });
+        }
+    }
 
     match poll_result {
         Ok(Poll::Ready(out)) => complete::<F, S>(header, cell, Ok(out)),
@@ -182,9 +242,40 @@ pub(super) unsafe fn dealloc<F: Future, S: Schedule>(header: NonNull<Header>) {
 
 pub(super) unsafe fn dealloc_now<F: Future, S: Schedule>(header: NonNull<Header>) {
     let cell = cell_ptr::<F, S>(header);
+    let task_id = (*cell).header.task_id;
+    #[cfg(feature = "instrumentation")]
+    let (total_polls, total_busy, total_idle) = (
+        (*cell)
+            .header
+            .polls
+            .load(std::sync::atomic::Ordering::Relaxed),
+        std::time::Duration::from_nanos(
+            (*cell)
+                .header
+                .busy_ns
+                .load(std::sync::atomic::Ordering::Relaxed),
+        ),
+        std::time::Duration::from_nanos(
+            (*cell)
+                .header
+                .idle_ns
+                .load(std::sync::atomic::Ordering::Relaxed),
+        ),
+    );
+    #[cfg(not(feature = "instrumentation"))]
+    let (total_polls, total_busy, total_idle) =
+        (0, std::time::Duration::ZERO, std::time::Duration::ZERO);
+    crate::instrument::emit(|| crate::instrument::RuntimeEvent::TaskDropped {
+        id: task_id,
+        total_polls,
+        total_busy,
+        total_idle,
+    });
+    crate::instrument::task_finished(&(*cell).header.metrics);
     // SAFETY: the deferred deallocation entry owns the final reference and
     // is run only after the scheduler has transferred it to its owner.
     drop(Box::from_raw(cell));
+    crate::task::raw::record_dealloc();
 }
 
 pub(super) unsafe fn try_read_output<F: Future, S: Schedule>(
@@ -208,8 +299,8 @@ pub(super) unsafe fn try_read_output<F: Future, S: Schedule>(
     };
 
     if let Some(result) = result {
-        let dst = dst as *mut std::result::Result<F::Output, JoinErrorRepr>;
-        std::ptr::write(dst, result);
+        let dst = dst as *mut Option<std::result::Result<F::Output, JoinErrorRepr>>;
+        std::ptr::write(dst, Some(result));
         // The JoinHandle reference ends here. Decrement only after the stage
         // lock is released so deallocation cannot invalidate a live guard.
         RawTask::from_raw(header).drop_reference();
@@ -252,6 +343,9 @@ pub(super) unsafe fn shutdown<F: Future, S: Schedule>(header: NonNull<Header>) {
     if before.is_complete() || before.is_cancelled() {
         return; // already finished; cancellation after the fact is a no-op
     }
+    crate::instrument::emit(|| crate::instrument::RuntimeEvent::TaskAborted {
+        id: raw.header().task_id,
+    });
     if before.is_running() {
         // A poll is in flight RIGHT NOW. We must NOT touch `stage` here —
         // that poll already holds exclusive access to it. It will observe

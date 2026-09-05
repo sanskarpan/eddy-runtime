@@ -124,6 +124,9 @@ impl Future for Notified<'_> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         // SAFETY: polling does not move the pinned future allocation.
         let this = unsafe { self.get_unchecked_mut() };
+        if crate::coop::poll_proceed(cx).is_pending() {
+            return Poll::Pending;
+        }
         let mut state = this.inner.state.lock().unwrap();
         if this.waiter.notified.load(Ordering::Acquire) {
             return Poll::Ready(());
