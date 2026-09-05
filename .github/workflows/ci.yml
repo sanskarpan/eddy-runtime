@@ -103,7 +103,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: io_uring backend and owned-buffer tests
-         run: 'timeout 30s cargo test -p eddy --features io-uring io::uring::tests:: -- --test-threads=1 --nocapture'
+        run: 'timeout 30s cargo test -p eddy --features io-uring io::uring::tests:: -- --test-threads=1 --nocapture'
 
   asan:
     name: io_uring owned-buffer ASan (Linux)
