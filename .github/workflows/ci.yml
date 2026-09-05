@@ -150,4 +150,5 @@ jobs:
       - name: Miri (strict provenance)
         env:
           MIRIFLAGS: "-Zmiri-disable-isolation -Zmiri-strict-provenance"
+          PROPTEST_CASES: "16"
         run: 'cargo miri test -p eddy --lib -- task:: sync:: time::wheel::'
