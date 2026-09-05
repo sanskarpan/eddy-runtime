@@ -2740,7 +2740,14 @@ mod tests {
             ring.poll_completions();
             std::thread::sleep(Duration::from_millis(1));
         }
-        assert_eq!(ring.inner.state.lock().unwrap().orphaned.len(), 0);
+        let state = ring.inner.state.lock().unwrap();
+        eprintln!(
+            "orphaned={} orphaned_by_user_data={} cancel_targets={}",
+            state.orphaned.len(),
+            state.orphaned_by_user_data.len(),
+            state.cancel_targets.len()
+        );
+        assert_eq!(state.orphaned.len(), 0);
     }
 
     #[test]
