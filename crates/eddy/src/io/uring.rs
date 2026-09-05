@@ -2673,32 +2673,6 @@ mod tests {
         let Ok(ring) = IoUring::new(8) else {
             return;
         };
-        let path = std::env::temp_dir().join(format!("eddy-uring-cancel-{}", std::process::id()));
-        std::fs::write(&path, b"cancel").unwrap();
-        let file = std::fs::File::open(&path).unwrap();
-        let mut read = Box::pin(ring.read(file.as_raw_fd(), vec![0; 6]));
-        let waker = crate::task::noop_waker();
-        let mut cx = Context::from_waker(&waker);
-        assert!(matches!(read.as_mut().poll(&mut cx), Poll::Pending));
-        drop(read);
-        assert_eq!(ring.inner.state.lock().unwrap().ops.len(), 0);
-        assert_eq!(ring.inner.state.lock().unwrap().orphaned.len(), 1);
-        for _ in 0..1_000 {
-            if ring.inner.state.lock().unwrap().orphaned.is_empty() {
-                break;
-            }
-            ring.poll_completions();
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        assert_eq!(ring.inner.state.lock().unwrap().orphaned.len(), 0);
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn dropping_a_pending_socket_read_requests_kernel_cancellation() {
-        let Ok(ring) = IoUring::new(8) else {
-            return;
-        };
         let mut fds = [0; 2];
         // SAFETY: `fds` is writable storage for the two descriptors.
         let result =

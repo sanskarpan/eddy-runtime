@@ -161,6 +161,7 @@ fn tcp_echo_handles_many_concurrent_connections() {
                 stream.read_exact(&mut response).await.unwrap();
                 assert_eq!(&response, b"ping");
             }));
+            eddy::future::yield_now().await;
         }
         for client in clients {
             client.await.unwrap();
