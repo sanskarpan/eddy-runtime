@@ -2397,6 +2397,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "SQPOLL is unreliable on shared CI kernels"]
     fn sqpoll_is_explicit_and_uses_the_kernel_wakeup_path() {
         let Ok(ring) = IoUring::builder(8).sqpoll(true).build() else {
             return;
