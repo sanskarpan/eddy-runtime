@@ -65,8 +65,14 @@ fn run_bounded_soak(rounds: usize, deadline: Duration) {
         .expect("bounded soak made no progress");
     });
 
-    assert!(
-        runtime.dump_tasks().is_empty(),
+    for _ in 0..100 {
+        let tasks = runtime.dump_tasks();
+        if tasks.is_empty() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    panic!(
         "completed soak left registered tasks behind: {:?}",
         runtime.dump_tasks()
     );

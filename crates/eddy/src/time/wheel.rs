@@ -493,10 +493,11 @@ mod tests {
 
     #[test]
     fn one_hundred_thousand_inserts_and_cancels_complete_quickly() {
+        const ENTRIES: u64 = if cfg!(miri) { 1_000 } else { 100_000 };
         let mut wheel = Wheel::new();
-        let mut entries = Vec::with_capacity(100_000);
+        let mut entries = Vec::with_capacity(ENTRIES as usize);
         let started = std::time::Instant::now();
-        for i in 0..100_000u64 {
+        for i in 0..ENTRIES {
             let item = entry(1 + (i % 50_000));
             wheel.insert(item.clone());
             entries.push(item);
@@ -507,7 +508,7 @@ mod tests {
         let elapsed = started.elapsed();
         assert!(
             elapsed < std::time::Duration::from_secs(2),
-            "insert+cancel of 100k timers took {elapsed:?}, expected O(1) per op"
+            "insert+cancel of {ENTRIES} timers took {elapsed:?}, expected O(1) per op"
         );
     }
 
