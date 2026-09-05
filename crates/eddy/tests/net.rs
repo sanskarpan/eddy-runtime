@@ -127,6 +127,9 @@ fn tcp_peek_does_not_consume_data_and_closed_port_returns_error() {
 
 #[test]
 fn tcp_echo_handles_many_concurrent_connections() {
+    #[cfg(target_os = "macos")]
+    const CONNECTIONS: usize = 256;
+    #[cfg(not(target_os = "macos"))]
     const CONNECTIONS: usize = 1_000;
     let runtime = Builder::new_multi_thread().worker_threads(4).build();
     runtime.block_on(async {

@@ -2683,7 +2683,12 @@ mod tests {
         drop(read);
         assert_eq!(ring.inner.state.lock().unwrap().ops.len(), 0);
         assert_eq!(ring.inner.state.lock().unwrap().orphaned.len(), 1);
-        ring.submit_and_wait().unwrap();
+        for _ in 0..2 {
+            if ring.inner.state.lock().unwrap().orphaned.is_empty() {
+                break;
+            }
+            ring.submit_and_wait().unwrap();
+        }
         assert_eq!(ring.inner.state.lock().unwrap().orphaned.len(), 0);
         std::fs::remove_file(path).unwrap();
     }

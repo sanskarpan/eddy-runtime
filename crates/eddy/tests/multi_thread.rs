@@ -94,7 +94,7 @@ fn thread_stack_size_and_name_are_applied() {
     let rt = Builder::new_multi_thread()
         .worker_threads(1)
         .thread_name("custom-worker")
-        .thread_stack_size(64 * 1024)
+        .thread_stack_size(256 * 1024)
         .on_thread_start(move || {
             *name_for_hook.lock().unwrap() =
                 std::thread::current().name().unwrap_or("").to_string();
