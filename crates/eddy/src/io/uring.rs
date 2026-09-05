@@ -2704,15 +2704,10 @@ mod tests {
         let Ok(ring) = IoUring::new(8) else {
             return;
         };
-        let mut fds = [0; 2];
-        // SAFETY: `fds` is writable storage for the two descriptors.
-        let result = unsafe { libc::pipe(fds.as_mut_ptr()) };
-        assert_eq!(result, 0);
-        // SAFETY: pipe returned two owned descriptors.
-        let read_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
-        // SAFETY: pipe returned two owned descriptors.
-        let write_fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
-        let mut read = Box::pin(ring.read(read_fd.as_raw_fd(), vec![0; 1]));
+        let path = std::env::temp_dir().join(format!("eddy-uring-orphan-{}", std::process::id()));
+        std::fs::write(&path, [7u8]).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let mut read = Box::pin(ring.read(file.as_raw_fd(), vec![0; 1]));
         let waker = crate::task::noop_waker();
         let mut cx = Context::from_waker(&waker);
         assert!(matches!(read.as_mut().poll(&mut cx), Poll::Pending));
@@ -2720,18 +2715,6 @@ mod tests {
         drop(read);
         assert_eq!(ring.inner.state.lock().unwrap().orphaned.len(), 1);
 
-        // If cancellation loses the race, this byte still gives the target
-        // read a CQE, so the test never depends on a particular kernel race.
-        let byte = [7u8; 1];
-        // SAFETY: `write_fd` is a live stream socket and `byte` is valid.
-        let written = unsafe {
-            libc::write(
-                write_fd.as_raw_fd(),
-                byte.as_ptr().cast::<libc::c_void>(),
-                byte.len(),
-            )
-        };
-        assert_eq!(written, 1);
         for _ in 0..5_000 {
             if ring.inner.state.lock().unwrap().orphaned.is_empty() {
                 break;
@@ -2753,6 +2736,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         assert_eq!(ring.inner.state.lock().unwrap().orphaned.len(), 0);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
