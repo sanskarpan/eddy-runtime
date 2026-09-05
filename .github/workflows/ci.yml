@@ -149,5 +149,5 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Miri (strict provenance)
         env:
-          MIRIFLAGS: "-Zmiri-strict-provenance"
+          MIRIFLAGS: "-Zmiri-disable-isolation -Zmiri-strict-provenance"
         run: 'cargo miri test -p eddy --lib -- task:: sync:: time::wheel::'

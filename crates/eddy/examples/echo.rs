@@ -1,7 +1,9 @@
 //! Minimal TCP echo server using Eddy's readiness-backed sockets.
 
+#[cfg(unix)]
 use eddy::io::{AsyncReadExt, AsyncWriteExt, TcpListener};
 
+#[cfg(unix)]
 fn main() {
     let runtime = eddy::Builder::new_multi_thread().worker_threads(2).build();
     runtime.block_on(async {
@@ -28,4 +30,9 @@ fn main() {
             println!("accepted {peer}");
         }
     });
+}
+
+#[cfg(not(unix))]
+fn main() {
+    eprintln!("the echo example requires Eddy's Unix networking API");
 }

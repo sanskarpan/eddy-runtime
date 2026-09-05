@@ -133,11 +133,19 @@ fn tcp_echo_handles_many_concurrent_connections() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = eddy::Handle::current().spawn(async move {
+            let handle = eddy::Handle::current();
+            let mut workers = Vec::with_capacity(CONNECTIONS);
             for _ in 0..CONNECTIONS {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let mut request = [0u8; 4];
-                stream.read_exact(&mut request).await.unwrap();
-                stream.write_all(&request).await.unwrap();
+                let (stream, _) = listener.accept().await.unwrap();
+                workers.push(handle.spawn(async move {
+                    let mut stream = stream;
+                    let mut request = [0u8; 4];
+                    stream.read_exact(&mut request).await.unwrap();
+                    stream.write_all(&request).await.unwrap();
+                }));
+            }
+            for worker in workers {
+                worker.await.unwrap();
             }
         });
 

@@ -671,7 +671,7 @@ impl IoUring {
             ring: self.clone(),
             fd,
             offset,
-            buffers: Some(vectored_resource(buffers)),
+            resource: Some(vectored_resource(buffers)),
             key: None,
         }
     }
@@ -687,7 +687,7 @@ impl IoUring {
             ring: self.clone(),
             fd,
             offset,
-            buffers: Some(vectored_resource(buffers)),
+            resource: Some(vectored_resource(buffers)),
             key: None,
         }
     }

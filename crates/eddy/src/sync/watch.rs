@@ -134,7 +134,7 @@ impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
         let wakers = {
             let mut state = self.inner.state.lock().unwrap();
-            state.wakers.drain(..).collect::<Vec<_>>()
+            std::mem::take(&mut state.wakers)
         };
         for waker in wakers {
             waker.wake();
