@@ -1061,13 +1061,17 @@ impl IoUring {
             .cancel_targets
             .insert(cancel_user_data, target_user_data);
         drop(state);
-        if self.submit().is_err() {
-            self.inner
-                .state
-                .lock()
-                .unwrap()
-                .cancel_targets
-                .remove(&cancel_user_data);
+        match self.submit() {
+            Ok(submitted) => eprintln!("submitted cancel SQEs={submitted}"),
+            Err(error) => {
+                eprintln!("cancel submit failed: {error}");
+                self.inner
+                    .state
+                    .lock()
+                    .unwrap()
+                    .cancel_targets
+                    .remove(&cancel_user_data);
+            }
         }
     }
 }
@@ -2717,7 +2721,8 @@ mod tests {
         let waker = crate::task::noop_waker();
         let mut cx = Context::from_waker(&waker);
         assert!(matches!(read.as_mut().poll(&mut cx), Poll::Pending));
-        ring.submit().unwrap();
+        let submitted = ring.submit().unwrap();
+        eprintln!("submitted read SQEs={submitted}");
         drop(read);
         assert_eq!(ring.inner.state.lock().unwrap().orphaned.len(), 1);
 
