@@ -2700,20 +2700,19 @@ mod tests {
     }
 
     #[test]
-    fn dropping_a_recv_orphans_it_until_the_cqe() {
+    fn dropping_a_read_orphans_it_until_the_cqe() {
         let Ok(ring) = IoUring::new(8) else {
             return;
         };
         let mut fds = [0; 2];
         // SAFETY: `fds` is writable storage for the two descriptors.
-        let result =
-            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+        let result = unsafe { libc::pipe(fds.as_mut_ptr()) };
         assert_eq!(result, 0);
-        // SAFETY: socketpair returned two owned descriptors.
+        // SAFETY: pipe returned two owned descriptors.
         let read_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
-        // SAFETY: socketpair returned two owned descriptors.
+        // SAFETY: pipe returned two owned descriptors.
         let write_fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
-        let mut read = Box::pin(ring.recv(read_fd.as_raw_fd(), vec![0; 1]));
+        let mut read = Box::pin(ring.read(read_fd.as_raw_fd(), vec![0; 1]));
         let waker = crate::task::noop_waker();
         let mut cx = Context::from_waker(&waker);
         assert!(matches!(read.as_mut().poll(&mut cx), Poll::Pending));
