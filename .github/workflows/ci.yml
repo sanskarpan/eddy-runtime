@@ -121,7 +121,7 @@ jobs:
         run: >-
           cargo test -Zbuild-std --target x86_64-unknown-linux-gnu
           -p eddy --features io-uring --lib
-          io::uring::tests::dropping_a_read_orphans_it_until_the_cqe
+          io::uring::tests::dropping_a_recv_orphans_it_until_the_cqe
 
   stress-long:
     name: ten-minute concurrency soak

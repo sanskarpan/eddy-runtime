@@ -1061,17 +1061,13 @@ impl IoUring {
             .cancel_targets
             .insert(cancel_user_data, target_user_data);
         drop(state);
-        match self.submit() {
-            Ok(submitted) => eprintln!("submitted cancel SQEs={submitted}"),
-            Err(error) => {
-                eprintln!("cancel submit failed: {error}");
-                self.inner
-                    .state
-                    .lock()
-                    .unwrap()
-                    .cancel_targets
-                    .remove(&cancel_user_data);
-            }
+        if self.submit().is_err() {
+            self.inner
+                .state
+                .lock()
+                .unwrap()
+                .cancel_targets
+                .remove(&cancel_user_data);
         }
     }
 }
@@ -2704,7 +2700,7 @@ mod tests {
     }
 
     #[test]
-    fn dropping_a_read_orphans_it_until_the_cqe() {
+    fn dropping_a_recv_orphans_it_until_the_cqe() {
         let Ok(ring) = IoUring::new(8) else {
             return;
         };
@@ -2717,12 +2713,11 @@ mod tests {
         let read_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
         // SAFETY: socketpair returned two owned descriptors.
         let write_fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
-        let mut read = Box::pin(ring.read(read_fd.as_raw_fd(), vec![0; 1]));
+        let mut read = Box::pin(ring.recv(read_fd.as_raw_fd(), vec![0; 1]));
         let waker = crate::task::noop_waker();
         let mut cx = Context::from_waker(&waker);
         assert!(matches!(read.as_mut().poll(&mut cx), Poll::Pending));
-        let submitted = ring.submit().unwrap();
-        eprintln!("submitted read SQEs={submitted}");
+        ring.submit().unwrap();
         drop(read);
         assert_eq!(ring.inner.state.lock().unwrap().orphaned.len(), 1);
 
@@ -2745,14 +2740,7 @@ mod tests {
             ring.poll_completions();
             std::thread::sleep(Duration::from_millis(1));
         }
-        let state = ring.inner.state.lock().unwrap();
-        eprintln!(
-            "orphaned={} orphaned_by_user_data={} cancel_targets={}",
-            state.orphaned.len(),
-            state.orphaned_by_user_data.len(),
-            state.cancel_targets.len()
-        );
-        assert_eq!(state.orphaned.len(), 0);
+        assert_eq!(ring.inner.state.lock().unwrap().orphaned.len(), 0);
     }
 
     #[test]
