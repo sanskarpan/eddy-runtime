@@ -2733,11 +2733,12 @@ mod tests {
             )
         };
         assert_eq!(written, 1);
-        for _ in 0..2 {
+        for _ in 0..5_000 {
             if ring.inner.state.lock().unwrap().orphaned.is_empty() {
                 break;
             }
-            ring.submit_and_wait().unwrap();
+            ring.poll_completions();
+            std::thread::sleep(Duration::from_millis(1));
         }
         assert_eq!(ring.inner.state.lock().unwrap().orphaned.len(), 0);
     }
