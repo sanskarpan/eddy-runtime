@@ -435,6 +435,7 @@ struct RingState {
     ops_by_user_data: HashMap<u64, usize>,
     orphaned: Slab<OrphanedOp>,
     orphaned_by_user_data: HashMap<u64, usize>,
+    cancel_targets: HashMap<u64, u64>,
     next_user_data: u64,
     sq_pending: u32,
 }
@@ -578,6 +579,7 @@ impl IoUring {
                     ops_by_user_data: HashMap::new(),
                     orphaned: Slab::new(),
                     orphaned_by_user_data: HashMap::new(),
+                    cancel_targets: HashMap::new(),
                     next_user_data: 1,
                     sq_pending: 0,
                 }),
@@ -1055,8 +1057,18 @@ impl IoUring {
         ) else {
             return;
         };
+        state
+            .cancel_targets
+            .insert(cancel_user_data, target_user_data);
         drop(state);
-        let _ = self.submit();
+        if self.submit().is_err() {
+            self.inner
+                .state
+                .lock()
+                .unwrap()
+                .cancel_targets
+                .remove(&cancel_user_data);
+        }
     }
 }
 
@@ -1354,7 +1366,15 @@ fn reap_completions_inner(inner: &Inner) -> usize {
         };
         // SAFETY: this CQE lies within the mapped CQ ring.
         let cqe = unsafe { ptr::read_volatile(cqe) };
-        if let Some(&key) = state.ops_by_user_data.get(&cqe.user_data) {
+        if let Some(target_user_data) = state.cancel_targets.remove(&cqe.user_data) {
+            if cqe.res == 0 {
+                if let Some(key) = state.orphaned_by_user_data.remove(&target_user_data) {
+                    state.orphaned.remove(key);
+                } else if let Some(key) = state.ops_by_user_data.remove(&target_user_data) {
+                    state.ops.remove(key);
+                }
+            }
+        } else if let Some(&key) = state.ops_by_user_data.get(&cqe.user_data) {
             if let Some(op) = state.ops.get_mut(key) {
                 op.result = Some(if cqe.res < 0 {
                     Err(io::Error::from_raw_os_error(-(cqe.res as i64) as i32))
@@ -1404,7 +1424,7 @@ impl Drop for Inner {
                 let Ok(cancel_user_data) = next_user_data(&mut state) else {
                     break;
                 };
-                let _ = queue_sqe_locked(
+                if queue_sqe_locked(
                     self,
                     &mut state,
                     IoUringSqe {
@@ -1422,7 +1442,11 @@ impl Drop for Inner {
                         splice_fd_in: 0,
                         pad2: [0; 2],
                     },
-                );
+                )
+                .is_ok()
+                {
+                    state.cancel_targets.insert(cancel_user_data, *target);
+                }
             }
             targets
         };
