@@ -2413,11 +2413,17 @@ mod tests {
         let waker = crate::task::noop_waker();
         let mut cx = Context::from_waker(&waker);
         assert!(matches!(read.as_mut().poll(&mut cx), Poll::Pending));
-        ring.submit_and_wait().unwrap();
-        let (result, buffer) = match read.as_mut().poll(&mut cx) {
-            Poll::Ready(value) => value,
-            Poll::Pending => panic!("SQPOLL CQE was not delivered"),
-        };
+        ring.submit().unwrap();
+        let completed = (0..5_000).find_map(|_| {
+            ring.poll_completions();
+            if let Poll::Ready(value) = read.as_mut().poll(&mut cx) {
+                Some(value)
+            } else {
+                std::thread::sleep(Duration::from_millis(1));
+                None
+            }
+        });
+        let (result, buffer) = completed.expect("SQPOLL CQE was not delivered");
         assert_eq!(result.unwrap(), 6);
         assert_eq!(buffer, b"sqpoll");
         drop(file);
