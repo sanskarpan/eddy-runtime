@@ -494,6 +494,7 @@ mod tests {
     #[test]
     fn one_hundred_thousand_inserts_and_cancels_complete_quickly() {
         const ENTRIES: u64 = if cfg!(miri) { 1_000 } else { 100_000 };
+        const MAX_SECONDS: u64 = if cfg!(miri) { 5 } else { 2 };
         let mut wheel = Wheel::new();
         let mut entries = Vec::with_capacity(ENTRIES as usize);
         let started = std::time::Instant::now();
@@ -507,7 +508,7 @@ mod tests {
         }
         let elapsed = started.elapsed();
         assert!(
-            elapsed < std::time::Duration::from_secs(2),
+            elapsed < std::time::Duration::from_secs(MAX_SECONDS),
             "insert+cancel of {ENTRIES} timers took {elapsed:?}, expected O(1) per op"
         );
     }
