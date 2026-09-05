@@ -2715,26 +2715,8 @@ mod tests {
         drop(read);
         assert_eq!(ring.inner.state.lock().unwrap().orphaned.len(), 1);
 
-        for _ in 0..5_000 {
-            if ring.inner.state.lock().unwrap().orphaned.is_empty() {
-                break;
-            }
-            // SAFETY: this is a nonblocking poll on the live ring with no
-            // signal mask; completion processing remains in userspace below.
-            unsafe {
-                libc::syscall(
-                    libc::SYS_io_uring_enter,
-                    ring.inner.fd,
-                    0,
-                    0,
-                    IORING_ENTER_GETEVENTS,
-                    ptr::null::<libc::c_void>(),
-                    0,
-                );
-            }
-            ring.poll_completions();
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        ring.submit_and_wait().unwrap();
+        ring.poll_completions();
         assert_eq!(ring.inner.state.lock().unwrap().orphaned.len(), 0);
         std::fs::remove_file(path).unwrap();
     }
