@@ -926,6 +926,8 @@ impl IoUring {
                 0,
             )
         };
+        #[cfg(test)]
+        eprintln!("io_uring enter wait result={result}");
         if result < 0 {
             return Err(io::Error::last_os_error());
         }
