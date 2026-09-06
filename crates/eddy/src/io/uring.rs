@@ -2725,8 +2725,20 @@ mod tests {
         drop(read);
         assert_eq!(ring.inner.state.lock().unwrap().orphaned.len(), 1);
 
+        {
+            let state = ring.inner.state.lock().unwrap();
+            eprintln!(
+                "orphan state ops={:?} orphaned={:?} cancels={:?}",
+                state.ops_by_user_data, state.orphaned_by_user_data, state.cancel_targets,
+            );
+        }
         ring.submit_and_wait().unwrap();
-        ring.poll_completions();
+        let reaped = ring.poll_completions();
+        eprintln!(
+            "after wait reaped={} orphaned={}",
+            reaped,
+            ring.inner.state.lock().unwrap().orphaned.len()
+        );
         if !ring.inner.state.lock().unwrap().orphaned.is_empty() {
             ring.submit_and_wait().unwrap();
             ring.poll_completions();
