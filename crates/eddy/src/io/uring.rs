@@ -1366,6 +1366,16 @@ fn reap_completions_inner(inner: &Inner) -> usize {
         };
         // SAFETY: this CQE lies within the mapped CQ ring.
         let cqe = unsafe { ptr::read_volatile(cqe) };
+        #[cfg(test)]
+        eprintln!(
+            "io_uring cqe user_data={} res={} flags={} cancel={} orphan={} op={}",
+            cqe.user_data,
+            cqe.res,
+            cqe.flags,
+            state.cancel_targets.contains_key(&cqe.user_data),
+            state.orphaned_by_user_data.contains_key(&cqe.user_data),
+            state.ops_by_user_data.contains_key(&cqe.user_data),
+        );
         if let Some(target_user_data) = state.cancel_targets.remove(&cqe.user_data) {
             if cqe.res == 0 {
                 if let Some(key) = state.orphaned_by_user_data.remove(&target_user_data) {
