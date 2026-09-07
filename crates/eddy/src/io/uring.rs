@@ -2371,7 +2371,7 @@ impl AsyncWriteOwned for IoUring {
 mod tests {
     use super::*;
     use std::net::TcpListener;
-    use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+    use std::os::fd::{AsRawFd, IntoRawFd};
     use std::task::Context;
 
     #[test]

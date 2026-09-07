@@ -68,7 +68,10 @@ macros.
 
 The repository CI already separates these checks: Linux native tests,
 aarch64/qemu, Windows, loom, strict-provenance Miri, ASan, and the
-feature-gated io_uring job.
+feature-gated io_uring job. The io_uring job is non-blocking on shared GitHub
+runners because those runners currently do not provide reliable CQE delivery;
+it remains a visible diagnostic and must be repeated on a dedicated Linux
+kernel for release validation.
 
 ## Phase 17 Tests
 
