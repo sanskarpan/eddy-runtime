@@ -536,7 +536,7 @@
 **Miri**
 - [x] 🔴 Miri over the task allocation, waker vtable, intrusive lists, `ReadBuf` (task/waker/intrusive lists done — 35 lib tests clean; `ReadBuf`/io paths call foreign syscalls Miri cannot run, covered by the other gate jobs)
 - [x] 🔴 Stacked-borrows clean (no `-Zmiri-tag-raw-pointers` suppressions) — caught and fixed the intrusive-list violation (ISSUES.md C3)
-- [ ] 🔴 `-Zmiri-strict-provenance` clean
+- [x] 🔴 `-Zmiri-strict-provenance` clean
 
 **Differential vs Tokio**
 - [x] 🟡 Same workload on both → same results (bounded channel, select, timeout traces)
