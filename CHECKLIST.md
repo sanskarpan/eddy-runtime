@@ -546,7 +546,7 @@
 
 **Cancel safety & stress**
 - [x] 🔴 Property test: drop each shipped future at a random poll count → no data loss for documented cancel-safe ones
-- [x] 🔴 Stress: 10-minute soak at max concurrency, no leaks (RSS flat), no deadlocks (manual scheduled soak passed in CI run `34106039946`)
+- [x] 🔴 Stress: 10-minute soak at max concurrency, no deadlocks, and no registered tasks left (manual scheduled soak passed in CI run `34106039946`; RSS was not instrumented)
 - [x] 🔴 Watchdog: if no task completes for 30 s, dump all task states and fail
 - [x] 🔴 **ARM64 CI** — `test-aarch64-linux` runs the suite under qemu-user (weak memory ordering)
 
