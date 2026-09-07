@@ -487,9 +487,7 @@ impl DriverShared {
             let weak = weak.clone();
             let notify = Arc::new(move || {
                 if let Some(driver) = weak.upgrade() {
-                    if let Err(error) = driver.poller.wake() {
-                        tracing::warn!(?error, "eddy: driver wake failed");
-                    }
+                    driver.notify_driver();
                 }
             });
             DriverShared {
@@ -616,14 +614,7 @@ impl DriverShared {
         }
     }
 
-    /// Make sure the driver re-runs so a task routed to the global injector
-    /// (or to a specific worker) is serviced. Called after routing a task.
-    ///
-    /// The wake must not depend on `id`'s driver state: the target thread may
-    /// be blocked in `thread::park()` (a nested `block_on`), not in the
-    /// driver at all. The injector is shared, so interrupting whichever
-    /// worker holds the kernel wait — or a condvar sleeper — is sufficient.
-    pub(crate) fn unpark_worker(&self, id: usize) {
+    fn notify_driver(&self) {
         self.wake_pending.store(true, Ordering::Release);
         let state = self.park.lock().unwrap();
         if state.waiters > 0 {
@@ -634,12 +625,22 @@ impl DriverShared {
             // different worker holding the kernel wait: one spurious poller
             // return and a work re-check is harmless (H1) and closes the
             // window where the target parks outside the driver.
-            let _ = id;
             drop(state);
             if let Err(error) = self.poller.wake() {
                 tracing::warn!(?error, "eddy: driver wake failed");
             }
         }
+    }
+
+    /// Make sure the driver re-runs so a task routed to the global injector
+    /// (or to a specific worker) is serviced. Called after routing a task.
+    ///
+    /// The wake must not depend on `id`'s driver state: the target thread may
+    /// be blocked in `thread::park()` (a nested `block_on`), not in the
+    /// driver at all. The injector is shared, so interrupting whichever
+    /// worker holds the kernel wait — or a condvar sleeper — is sufficient.
+    pub(crate) fn unpark_worker(&self, _id: usize) {
+        self.notify_driver();
     }
 
     /// Wake every parked worker (shutdown path): the condvar sleepers and
