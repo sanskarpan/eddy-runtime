@@ -58,11 +58,13 @@ CQE cancellation test under Linux with ASan or Valgrind where available.
 CI runs the pure-module Miri selection with `MIRIFLAGS=-Zmiri-strict-provenance`.
 The Linux ASan job uses nightly `-Zsanitizer=address` and only the
 `dropping_a_read_orphans_it_until_the_cqe` io_uring test. This keeps kernel
-availability and sanitizer failures isolated from the portable test gate; the
-io_uring test intentionally accepts an unavailable kernel feature as a valid
-fallback result. It rebuilds the Linux standard library with `-Zbuild-std` and
-uses an explicit target so sanitizer flags do not affect host build scripts or
-procedural macros.
+availability and sanitizer failures isolated from the portable test gate. The
+test is ignored by default because shared GitHub kernels have returned from
+`io_uring_enter(GETEVENTS)` without delivering a matching CQE; run it with
+`--ignored` on a dedicated Linux kernel to validate orphan-buffer reclamation.
+It rebuilds the Linux standard library with `-Zbuild-std` and uses an explicit
+target so sanitizer flags do not affect host build scripts or procedural
+macros.
 
 The repository CI already separates these checks: Linux native tests,
 aarch64/qemu, Windows, loom, strict-provenance Miri, ASan, and the
