@@ -27,10 +27,11 @@ The ring probe treats `ENOSYS` and `EPERM` as an unavailable kernel feature;
 that is a valid result for a restricted container and should fall back to the
 epoll driver. Do not grant `--privileged` merely to make this probe pass.
 
-The current operation state is single-CQE by design. Multishot accept/receive
-therefore returns `Unsupported` rather than exposing a stream API that could
-drop a later CQE or release its buffer too early; implementing it requires a
-separate multi-completion state machine.
+Multishot accept and receive use a separate multi-completion state machine.
+`AcceptMultishot` yields owned descriptors, while `RecvMultishot` uses an owned
+provided-buffer pool and copies each completed packet before returning its
+buffer to the kernel. The stream retains orphaned buffers through cancellation
+and waits for the cleanup CQE before releasing them.
 
 ## ARM
 
