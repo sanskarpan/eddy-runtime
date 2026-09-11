@@ -14,7 +14,7 @@
 //! still in flight. `IORING_OP_ASYNC_CANCEL` is best effort, but cancellation
 //! never releases the buffer before the target CQE arrives.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::io;
 use std::mem::size_of;
@@ -30,8 +30,8 @@ use std::time::Duration;
 use slab::Slab;
 
 const IORING_OFF_SQ_RING: libc::off_t = 0;
-const IORING_OFF_CQ_RING: libc::off_t = 0x8000_0000;
-const IORING_OFF_SQES: libc::off_t = 0x1_0000_0000;
+const IORING_OFF_CQ_RING: libc::off_t = 0x0800_0000;
+const IORING_OFF_SQES: libc::off_t = 0x1000_0000;
 const IORING_FEAT_SINGLE_MMAP: u32 = 1 << 0;
 const IORING_SETUP_SQPOLL: u32 = 1 << 1;
 const IORING_SQ_NEED_WAKEUP: u32 = 1 << 0;
@@ -52,6 +52,15 @@ const IORING_OP_READ: u8 = 22;
 const IORING_OP_WRITE: u8 = 23;
 const IORING_OP_SEND: u8 = 26;
 const IORING_OP_RECV: u8 = 27;
+const IORING_OP_PROVIDE_BUFFERS: u8 = 31;
+const IORING_OP_REMOVE_BUFFERS: u8 = 32;
+const IOSQE_IO_DRAIN: u8 = 1 << 1;
+const IOSQE_BUFFER_SELECT: u8 = 1 << 5;
+const IORING_ACCEPT_MULTISHOT: u16 = 1;
+const IORING_RECV_MULTISHOT: u16 = 1 << 1;
+const IORING_CQE_F_BUFFER: u32 = 1 << 0;
+const IORING_CQE_F_MORE: u32 = 1 << 1;
+const IORING_CQE_BUFFER_SHIFT: u32 = 16;
 
 /// Configuration used when creating an [`IoUring`].
 ///
@@ -158,6 +167,7 @@ impl MmapRegion {
         }
         // SAFETY: mmap returned a non-MAP_FAILED pointer.
         Ok(MmapRegion {
+            // SAFETY: the pointer was checked against MAP_FAILED above.
             ptr: unsafe { NonNull::new_unchecked(ptr.cast()) },
             len,
             unmap: true,
@@ -201,6 +211,10 @@ enum OpResource {
         buffer: Vec<u8>,
     },
     Accept,
+    MultishotAccept,
+    MultishotRecv {
+        buffer: Vec<u8>,
+    },
     Close,
 }
 
@@ -230,15 +244,7 @@ impl OpResource {
                     )
                 })?,
             )),
-            OpResource::Address { bytes, length } => Ok((
-                bytes.as_ptr() as u64,
-                u32::try_from(*length).map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "eddy: socket address is too large",
-                    )
-                })?,
-            )),
+            OpResource::Address { bytes, length } => Ok((bytes.as_ptr() as u64, *length)),
             OpResource::FixedBuffer {
                 registration,
                 index,
@@ -256,7 +262,10 @@ impl OpResource {
                     )
                 })?,
             )),
-            OpResource::Accept | OpResource::Close => Ok((0, 0)),
+            OpResource::Accept
+            | OpResource::MultishotAccept
+            | OpResource::MultishotRecv { .. }
+            | OpResource::Close => Ok((0, 0)),
         }
     }
 
@@ -423,11 +432,32 @@ struct OpState {
     result: Option<io::Result<usize>>,
     waker: Option<Waker>,
     user_data: u64,
+    multishot: Option<MultishotState>,
 }
 
 struct OrphanedOp {
     resource: OpResource,
     user_data: u64,
+    multishot: Option<MultishotState>,
+}
+
+enum MultishotEvent {
+    Accept(io::Result<RawFd>),
+    Recv(io::Result<(usize, Vec<u8>)>),
+}
+
+struct MultishotState {
+    event_kind: MultishotEventKind,
+    events: VecDeque<MultishotEvent>,
+    terminal: bool,
+    cleanup_complete: bool,
+    cleanup_user_data: Option<u64>,
+}
+
+#[derive(Clone, Copy)]
+enum MultishotEventKind {
+    Accept,
+    Recv { buffer_size: u32, buffer_group: u16 },
 }
 
 struct RingState {
@@ -436,7 +466,10 @@ struct RingState {
     orphaned: Slab<OrphanedOp>,
     orphaned_by_user_data: HashMap<u64, usize>,
     cancel_targets: HashMap<u64, u64>,
+    provide_targets: HashMap<u64, u64>,
+    cleanup_targets: HashSet<u64>,
     next_user_data: u64,
+    next_buffer_group: u16,
     sq_pending: u32,
 }
 
@@ -580,7 +613,10 @@ impl IoUring {
                     orphaned: Slab::new(),
                     orphaned_by_user_data: HashMap::new(),
                     cancel_targets: HashMap::new(),
+                    provide_targets: HashMap::new(),
+                    cleanup_targets: HashSet::new(),
                     next_user_data: 1,
+                    next_buffer_group: 1,
                     sq_pending: 0,
                 }),
             }),
@@ -805,25 +841,41 @@ impl IoUring {
         }
     }
 
-    /// Report that multishot accept is not supported by this ring state.
+    /// Create a multishot accept stream.
     ///
-    /// This method deliberately does not submit an SQE. Multishot CQEs reuse
-    /// one `user_data` value, while this backend's operation table treats one
-    /// CQE as terminal and releases the operation after that CQE. Returning an
-    /// explicit error is safer than exposing a future that would lose events
-    /// or close a descriptor belonging to a later shot.
-    pub fn accept_multishot(&self, _fd: RawFd) -> io::Result<()> {
-        Err(multishot_unsupported("accept"))
+    /// Call [`AcceptMultishot::poll_next`] to receive each accepted descriptor.
+    /// The operation remains owned by the stream until its final CQE, including
+    /// when the stream is dropped.
+    pub fn accept_multishot(&self, fd: RawFd) -> AcceptMultishot {
+        AcceptMultishot {
+            ring: self.clone(),
+            fd,
+            key: None,
+            start_error: None,
+            done: false,
+        }
     }
 
-    /// Report that multishot receive is not supported by this ring state.
+    /// Create a multishot receive stream backed by `buffer_count` owned buffers.
     ///
-    /// The supplied buffer is borrowed because this method returns
-    /// immediately and never gives the kernel access to it. A real multishot
-    /// receive API also needs provided-buffer or equivalent per-shot
-    /// ownership, which this backend does not implement.
-    pub fn recv_multishot(&self, _fd: RawFd, _buffer: &mut [u8]) -> io::Result<()> {
-        Err(multishot_unsupported("receive"))
+    /// Each item returned by [`RecvMultishot::poll_next`] owns a copy of the
+    /// received bytes. The backing buffers are returned to the kernel after
+    /// every CQE, so callers never access memory concurrently with the kernel.
+    pub fn recv_multishot(
+        &self,
+        fd: RawFd,
+        buffer_size: usize,
+        buffer_count: usize,
+    ) -> RecvMultishot {
+        RecvMultishot {
+            ring: self.clone(),
+            fd,
+            buffer_size,
+            buffer_count,
+            key: None,
+            start_error: None,
+            done: false,
+        }
     }
 
     /// Create an asynchronous close for a descriptor owned by the caller.
@@ -846,6 +898,7 @@ impl IoUring {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn start_op(
         &self,
         opcode: u8,
@@ -866,6 +919,7 @@ impl IoUring {
             result: None,
             waker: Some(waker),
             user_data,
+            multishot: None,
         });
         state.ops_by_user_data.insert(user_data, key);
         let (addr, resource_length) = match state.ops[key].resource.addr_len() {
@@ -886,9 +940,19 @@ impl IoUring {
                 flags: u8::from(fixed_file.is_some()),
                 ioprio: 0,
                 fd: fixed_file.unwrap_or(fd),
-                off: offset,
+                off: if opcode == IORING_OP_CONNECT {
+                    u64::from(resource_length)
+                } else {
+                    offset
+                },
                 addr,
-                len: if length == 0 { resource_length } else { length },
+                len: if opcode == IORING_OP_CONNECT {
+                    0
+                } else if length == 0 {
+                    resource_length
+                } else {
+                    length
+                },
                 rw_flags,
                 user_data,
                 buf_index: buffer_index,
@@ -900,6 +964,163 @@ impl IoUring {
             state.ops_by_user_data.remove(&user_data);
             let op = state.ops.remove(key);
             return Err((error, op.resource));
+        }
+        Ok(key)
+    }
+
+    fn start_multishot_accept(&self, fd: RawFd, waker: Waker) -> io::Result<usize> {
+        let mut state = self.inner.state.lock().unwrap();
+        if sq_space_locked(&self.inner, &state) < 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "eddy: io_uring submission queue is full",
+            ));
+        }
+        let user_data = next_user_data(&mut state)?;
+        let key = state.ops.insert(OpState {
+            resource: OpResource::MultishotAccept,
+            result: None,
+            waker: Some(waker),
+            user_data,
+            multishot: Some(MultishotState {
+                event_kind: MultishotEventKind::Accept,
+                events: VecDeque::new(),
+                terminal: false,
+                cleanup_complete: true,
+                cleanup_user_data: None,
+            }),
+        });
+        state.ops_by_user_data.insert(user_data, key);
+        if let Err(error) = queue_sqe_locked(
+            &self.inner,
+            &mut state,
+            IoUringSqe {
+                opcode: IORING_OP_ACCEPT,
+                flags: 0,
+                ioprio: IORING_ACCEPT_MULTISHOT,
+                fd,
+                off: 0,
+                addr: 0,
+                len: 0,
+                rw_flags: (libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC) as u32,
+                user_data,
+                buf_index: 0,
+                personality: 0,
+                splice_fd_in: 0,
+                pad2: [0; 2],
+            },
+        ) {
+            state.ops_by_user_data.remove(&user_data);
+            state.ops.remove(key);
+            return Err(error);
+        }
+        Ok(key)
+    }
+
+    fn start_multishot_recv(
+        &self,
+        fd: RawFd,
+        buffer_size: usize,
+        buffer_count: usize,
+        waker: Waker,
+    ) -> io::Result<usize> {
+        let buffer_size = u32::try_from(buffer_size).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "eddy: multishot receive buffer is too large",
+            )
+        })?;
+        let buffer_count = u16::try_from(buffer_count).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "eddy: too many multishot receive buffers",
+            )
+        })?;
+        if buffer_size == 0 || buffer_count == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "eddy: multishot receive buffers must be non-empty",
+            ));
+        }
+        let buffer_len = buffer_size as usize * buffer_count as usize;
+        let mut state = self.inner.state.lock().unwrap();
+        if sq_space_locked(&self.inner, &state) < 2 {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "eddy: io_uring submission queue is full",
+            ));
+        }
+        let user_data = next_user_data(&mut state)?;
+        let buffer_group = state.next_buffer_group;
+        state.next_buffer_group = state.next_buffer_group.wrapping_add(1).max(1);
+        let key = state.ops.insert(OpState {
+            resource: OpResource::MultishotRecv {
+                buffer: vec![0; buffer_len],
+            },
+            result: None,
+            waker: Some(waker),
+            user_data,
+            multishot: Some(MultishotState {
+                event_kind: MultishotEventKind::Recv {
+                    buffer_size,
+                    buffer_group,
+                },
+                events: VecDeque::new(),
+                terminal: false,
+                cleanup_complete: false,
+                cleanup_user_data: None,
+            }),
+        });
+        state.ops_by_user_data.insert(user_data, key);
+        let control_user_data = next_user_data(&mut state)?;
+        let buffer_address = match &state.ops[key].resource {
+            OpResource::MultishotRecv { buffer, .. } => buffer.as_ptr() as u64,
+            _ => unreachable!("eddy: multishot receive lost its buffer"),
+        };
+        queue_sqe_locked(
+            &self.inner,
+            &mut state,
+            IoUringSqe {
+                opcode: IORING_OP_PROVIDE_BUFFERS,
+                flags: 0,
+                ioprio: 0,
+                fd: i32::from(buffer_count),
+                off: 0,
+                addr: buffer_address,
+                len: buffer_size,
+                rw_flags: 0,
+                user_data: control_user_data,
+                buf_index: buffer_group,
+                personality: 0,
+                splice_fd_in: 0,
+                pad2: [0; 2],
+            },
+        )?;
+        state.provide_targets.insert(control_user_data, user_data);
+        let queued = queue_sqe_locked(
+            &self.inner,
+            &mut state,
+            IoUringSqe {
+                opcode: IORING_OP_RECV,
+                flags: IOSQE_IO_DRAIN | IOSQE_BUFFER_SELECT,
+                ioprio: IORING_RECV_MULTISHOT,
+                fd,
+                off: 0,
+                addr: 0,
+                len: buffer_size,
+                rw_flags: 0,
+                user_data,
+                buf_index: buffer_group,
+                personality: 0,
+                splice_fd_in: 0,
+                pad2: [0; 2],
+            },
+        );
+        if let Err(error) = queued {
+            state.provide_targets.remove(&control_user_data);
+            state.ops_by_user_data.remove(&user_data);
+            state.ops.remove(key);
+            return Err(error);
         }
         Ok(key)
     }
@@ -957,6 +1178,39 @@ impl IoUring {
         ))
     }
 
+    fn take_multishot_event(&self, key: usize) -> Option<MultishotEvent> {
+        self.inner
+            .state
+            .lock()
+            .unwrap()
+            .ops
+            .get_mut(key)
+            .and_then(|op| op.multishot.as_mut())
+            .and_then(|state| state.events.pop_front())
+    }
+
+    fn multishot_finished(&self, key: usize) -> bool {
+        self.inner
+            .state
+            .lock()
+            .unwrap()
+            .ops
+            .get(key)
+            .and_then(|op| op.multishot.as_ref())
+            .is_some_and(|state| {
+                state.terminal && state.events.is_empty() && state.cleanup_complete
+            })
+    }
+
+    fn remove_multishot(&self, key: usize) {
+        let mut state = self.inner.state.lock().unwrap();
+        if let Some(op) = state.ops.get(key) {
+            let user_data = op.user_data;
+            state.ops_by_user_data.remove(&user_data);
+            state.ops.remove(key);
+        }
+    }
+
     fn take_buffer_result(&self, key: usize) -> Option<(io::Result<usize>, Vec<u8>)> {
         let (result, resource) = self.take_result(key)?;
         match resource {
@@ -1001,7 +1255,13 @@ impl IoUring {
 
     fn orphan(&self, key: usize) {
         let mut state = self.inner.state.lock().unwrap();
-        let Some(is_complete) = state.ops.get(key).map(|op| op.result.is_some()) else {
+        let Some(is_complete) = state.ops.get(key).map(|op| {
+            op.result.is_some()
+                || op
+                    .multishot
+                    .as_ref()
+                    .is_some_and(|multishot| multishot.terminal)
+        }) else {
             return;
         };
         let mut op = state.ops.remove(key);
@@ -1015,6 +1275,7 @@ impl IoUring {
                     unsafe { libc::close(fd as RawFd) };
                 }
             }
+            drop_multishot_events(op.multishot.take());
             // The CQE has already arrived, so dropping the retained resource is safe.
             return;
         }
@@ -1022,6 +1283,7 @@ impl IoUring {
         let orphan_key = state.orphaned.insert(OrphanedOp {
             resource: op.resource,
             user_data,
+            multishot: op.multishot,
         });
         state.orphaned_by_user_data.insert(user_data, orphan_key);
         drop(state);
@@ -1100,15 +1362,6 @@ fn is_unavailable(error: &io::Error) -> bool {
     matches!(
         error.raw_os_error(),
         Some(libc::ENOSYS | libc::EPERM | libc::EACCES | libc::ENODEV)
-    )
-}
-
-fn multishot_unsupported(operation: &str) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::Unsupported,
-        format!(
-            "eddy: io_uring multishot {operation} is unsupported by the single-CQE operation state"
-        ),
     )
 }
 
@@ -1199,29 +1452,184 @@ fn next_user_data(state: &mut RingState) -> io::Result<u64> {
     if candidate != 0
         && !state.ops_by_user_data.contains_key(&candidate)
         && !state.orphaned_by_user_data.contains_key(&candidate)
+        && !state.provide_targets.contains_key(&candidate)
+        && !state.cleanup_targets.contains(&candidate)
     {
         Ok(candidate)
     } else {
-        Err(io::Error::new(
-            io::ErrorKind::Other,
-            "eddy: io_uring user_data space exhausted",
-        ))
+        Err(io::Error::other("eddy: io_uring user_data space exhausted"))
+    }
+}
+
+fn sq_space_locked(inner: &Inner, _state: &RingState) -> u32 {
+    // SAFETY: these offsets are supplied by the kernel in `IoUringParams`.
+    let tail = unsafe { inner.sq_ring.at::<u32>(inner.params.sq_off.tail) };
+    // SAFETY: `head` is a kernel-provided SQ ring cursor.
+    let head = unsafe { inner.sq_ring.at::<u32>(inner.params.sq_off.head) };
+    // SAFETY: SQ head and tail are kernel-provided ring cursors.
+    let (tail, head) = unsafe {
+        (
+            load_ring_u32(tail, Ordering::Relaxed),
+            load_ring_u32(head, Ordering::Acquire),
+        )
+    };
+    inner
+        .params
+        .sq_entries
+        .saturating_sub(tail.wrapping_sub(head))
+}
+
+fn queue_provide_buffer_locked(
+    inner: &Inner,
+    state: &mut RingState,
+    target_user_data: u64,
+    address: u64,
+    length: u32,
+    buffer_group: u16,
+    buffer_id: u16,
+) -> io::Result<()> {
+    let user_data = next_user_data(state)?;
+    queue_sqe_locked(
+        inner,
+        state,
+        IoUringSqe {
+            opcode: IORING_OP_PROVIDE_BUFFERS,
+            flags: 0,
+            ioprio: 0,
+            fd: 1,
+            off: u64::from(buffer_id),
+            addr: address,
+            len: length,
+            rw_flags: 0,
+            user_data,
+            buf_index: buffer_group,
+            personality: 0,
+            splice_fd_in: 0,
+            pad2: [0; 2],
+        },
+    )?;
+    state.provide_targets.insert(user_data, target_user_data);
+    Ok(())
+}
+
+fn queue_remove_buffers_locked(
+    inner: &Inner,
+    state: &mut RingState,
+    target_user_data: u64,
+    buffer_count: u16,
+    buffer_group: u16,
+) -> io::Result<u64> {
+    let user_data = next_user_data(state)?;
+    queue_sqe_locked(
+        inner,
+        state,
+        IoUringSqe {
+            opcode: IORING_OP_REMOVE_BUFFERS,
+            flags: IOSQE_IO_DRAIN,
+            ioprio: 0,
+            fd: i32::from(buffer_count),
+            off: 0,
+            addr: 0,
+            len: 0,
+            rw_flags: 0,
+            user_data,
+            buf_index: buffer_group,
+            personality: 0,
+            splice_fd_in: 0,
+            pad2: [0; 2],
+        },
+    )?;
+    state.provide_targets.insert(user_data, target_user_data);
+    state.cleanup_targets.insert(user_data);
+    Ok(user_data)
+}
+
+fn cleanup_request(
+    resource: &OpResource,
+    multishot: Option<&MultishotState>,
+    user_data: u64,
+) -> Option<(u64, u16, u16)> {
+    let multishot = multishot?;
+    if !multishot.terminal || multishot.cleanup_complete || multishot.cleanup_user_data.is_some() {
+        return None;
+    }
+    let MultishotEventKind::Recv {
+        buffer_size,
+        buffer_group,
+    } = multishot.event_kind
+    else {
+        return None;
+    };
+    let OpResource::MultishotRecv { buffer } = resource else {
+        unreachable!("eddy: receive cleanup lost its buffers");
+    };
+    Some((
+        user_data,
+        u16::try_from(buffer.len() / buffer_size as usize).ok()?,
+        buffer_group,
+    ))
+}
+
+fn queue_pending_cleanups_locked(inner: &Inner, state: &mut RingState) -> bool {
+    let pending = state
+        .ops
+        .iter()
+        .filter_map(|(_, op)| cleanup_request(&op.resource, op.multishot.as_ref(), op.user_data))
+        .chain(state.orphaned.iter().filter_map(|(_, op)| {
+            cleanup_request(&op.resource, op.multishot.as_ref(), op.user_data)
+        }))
+        .collect::<Vec<_>>();
+    let mut queued = false;
+    for (target, count, group) in pending {
+        let Ok(cleanup_user_data) = queue_remove_buffers_locked(inner, state, target, count, group)
+        else {
+            continue;
+        };
+        if let Some((_, op)) = state.ops.iter_mut().find(|(_, op)| op.user_data == target) {
+            if let Some(multishot) = op.multishot.as_mut() {
+                multishot.cleanup_user_data = Some(cleanup_user_data);
+            }
+        }
+        if let Some((_, op)) = state
+            .orphaned
+            .iter_mut()
+            .find(|(_, op)| op.user_data == target)
+        {
+            if let Some(multishot) = op.multishot.as_mut() {
+                multishot.cleanup_user_data = Some(cleanup_user_data);
+            }
+        }
+        queued = true;
+    }
+    queued
+}
+
+fn drop_multishot_events(multishot: Option<MultishotState>) {
+    if let Some(multishot) = multishot {
+        for event in multishot.events {
+            if let MultishotEvent::Accept(Ok(fd)) = event {
+                // SAFETY: the stream owned every accepted descriptor queued in
+                // an unpolled event.
+                unsafe { libc::close(fd) };
+            }
+        }
     }
 }
 
 unsafe fn load_ring_u32(pointer: *mut u32, ordering: Ordering) -> u32 {
     // SAFETY: ring offsets are u32-aligned kernel ABI fields in shared mmap.
-    unsafe { (&*pointer.cast::<AtomicU32>()).load(ordering) }
+    unsafe { (*pointer.cast::<AtomicU32>()).load(ordering) }
 }
 
 unsafe fn store_ring_u32(pointer: *mut u32, value: u32, ordering: Ordering) {
     // SAFETY: ring offsets are u32-aligned kernel ABI fields in shared mmap.
-    unsafe { (&*pointer.cast::<AtomicU32>()).store(value, ordering) };
+    unsafe { (*pointer.cast::<AtomicU32>()).store(value, ordering) };
 }
 
 fn queue_sqe_locked(inner: &Inner, state: &mut RingState, sqe_value: IoUringSqe) -> io::Result<()> {
     // SAFETY: these offsets are supplied by the kernel in `IoUringParams`.
     let tail = unsafe { inner.sq_ring.at::<u32>(inner.params.sq_off.tail) };
+    // SAFETY: `head` is a kernel-provided SQ ring cursor.
     let head = unsafe { inner.sq_ring.at::<u32>(inner.params.sq_off.head) };
     // SAFETY: these pointers are kernel-provided ring cursors.
     let (tail_value, head_value, mask) = unsafe {
@@ -1276,6 +1684,7 @@ fn submit_inner(inner: &Inner) -> io::Result<usize> {
     if inner.params.flags & IORING_SETUP_SQPOLL != 0 {
         // SQPOLL consumes SQEs directly from the shared ring. An enter call
         // is needed only after the kernel thread has gone idle.
+        // SAFETY: SQPOLL flags are a kernel-owned field in the mapped SQ ring.
         let flags = unsafe {
             load_ring_u32(
                 inner.sq_ring.at::<u32>(inner.params.sq_off.flags),
@@ -1340,7 +1749,9 @@ fn reap_completions_inner(inner: &Inner) -> usize {
     let mut wake = Vec::new();
     let mut state = inner.state.lock().unwrap();
     // SAFETY: these offsets are supplied by the kernel in `IoUringParams`.
+    // SAFETY: `head` is a kernel-provided CQ ring cursor.
     let head = unsafe { inner.cq_ring.at::<u32>(inner.params.cq_off.head) };
+    // SAFETY: `tail` is a kernel-provided CQ ring cursor.
     let tail = unsafe { inner.cq_ring.at::<u32>(inner.params.cq_off.tail) };
     // SAFETY: the ring mask is a kernel-provided u32 field in the CQ mapping.
     let mask = unsafe {
@@ -1356,6 +1767,7 @@ fn reap_completions_inner(inner: &Inner) -> usize {
         let tail_value = load_ring_u32(tail, Ordering::Acquire);
         (current, tail_value.wrapping_sub(current))
     };
+    let mut refill_queued = false;
     for _ in 0..available {
         // SAFETY: the CQE mapping is sized from the kernel's CQ entry count
         // and `current` is masked to a valid slot.
@@ -1366,40 +1778,218 @@ fn reap_completions_inner(inner: &Inner) -> usize {
         };
         // SAFETY: this CQE lies within the mapped CQ ring.
         let cqe = unsafe { ptr::read_volatile(cqe) };
+        let mut refill = None;
         if let Some(target_user_data) = state.cancel_targets.remove(&cqe.user_data) {
             if cqe.res == 0 {
                 if let Some(key) = state.orphaned_by_user_data.remove(&target_user_data) {
-                    state.orphaned.remove(key);
+                    if state
+                        .orphaned
+                        .get(key)
+                        .and_then(|op| op.multishot.as_ref())
+                        .is_none()
+                    {
+                        state.orphaned.remove(key);
+                    } else {
+                        state.orphaned_by_user_data.insert(target_user_data, key);
+                    }
                 } else if let Some(key) = state.ops_by_user_data.remove(&target_user_data) {
-                    state.ops.remove(key);
+                    if state
+                        .ops
+                        .get(key)
+                        .and_then(|op| op.multishot.as_ref())
+                        .is_none()
+                    {
+                        state.ops.remove(key);
+                    } else {
+                        state.ops_by_user_data.insert(target_user_data, key);
+                    }
+                }
+            }
+        } else if let Some(target_user_data) = state.provide_targets.remove(&cqe.user_data) {
+            let is_cleanup = state.cleanup_targets.remove(&cqe.user_data);
+            if is_cleanup {
+                if let Some(&key) = state.ops_by_user_data.get(&target_user_data) {
+                    if let Some(op) = state.ops.get_mut(key) {
+                        if let Some(multishot) = op.multishot.as_mut() {
+                            multishot.cleanup_user_data = None;
+                            if cqe.res >= 0 {
+                                multishot.cleanup_complete = true;
+                            }
+                            if let Some(waker) = op.waker.take() {
+                                wake.push(waker);
+                            }
+                        }
+                    }
+                } else if let Some(&key) = state.orphaned_by_user_data.get(&target_user_data) {
+                    let mut remove = false;
+                    if let Some(op) = state.orphaned.get_mut(key) {
+                        if let Some(multishot) = op.multishot.as_mut() {
+                            multishot.cleanup_user_data = None;
+                            multishot.cleanup_complete = cqe.res >= 0;
+                            remove = multishot.cleanup_complete
+                                && multishot.terminal
+                                && multishot.events.is_empty();
+                        }
+                    }
+                    if remove {
+                        state.orphaned_by_user_data.remove(&target_user_data);
+                        state.orphaned.remove(key);
+                    }
+                }
+            } else if cqe.res < 0 {
+                let error = io::Error::from_raw_os_error(-(cqe.res as i64) as i32);
+                if let Some(&key) = state.ops_by_user_data.get(&target_user_data) {
+                    if let Some(op) = state.ops.get_mut(key) {
+                        if let Some(multishot) = op.multishot.as_mut() {
+                            multishot.events.push_back(match multishot.event_kind {
+                                MultishotEventKind::Accept => MultishotEvent::Accept(Err(error)),
+                                MultishotEventKind::Recv { .. } => MultishotEvent::Recv(Err(error)),
+                            });
+                            multishot.terminal = true;
+                            if let Some(waker) = op.waker.take() {
+                                wake.push(waker);
+                            }
+                        }
+                    }
                 }
             }
         } else if let Some(&key) = state.ops_by_user_data.get(&cqe.user_data) {
             if let Some(op) = state.ops.get_mut(key) {
-                op.result = Some(if cqe.res < 0 {
-                    Err(io::Error::from_raw_os_error(-(cqe.res as i64) as i32))
+                if let Some(multishot) = op.multishot.as_mut() {
+                    let more = cqe.flags & IORING_CQE_F_MORE != 0;
+                    match multishot.event_kind {
+                        MultishotEventKind::Accept => {
+                            multishot
+                                .events
+                                .push_back(MultishotEvent::Accept(if cqe.res < 0 {
+                                    Err(io::Error::from_raw_os_error(-(cqe.res as i64) as i32))
+                                } else {
+                                    Ok(cqe.res as RawFd)
+                                }));
+                        }
+                        MultishotEventKind::Recv {
+                            buffer_size,
+                            buffer_group,
+                        } => {
+                            if cqe.res < 0 {
+                                multishot.events.push_back(MultishotEvent::Recv(Err(
+                                    io::Error::from_raw_os_error(-(cqe.res as i64) as i32),
+                                )));
+                            } else if cqe.flags & IORING_CQE_F_BUFFER == 0 {
+                                multishot.events.push_back(MultishotEvent::Recv(Err(
+                                    io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        "eddy: multishot receive CQE did not select a buffer",
+                                    ),
+                                )));
+                            } else {
+                                let buffer_id = (cqe.flags >> IORING_CQE_BUFFER_SHIFT) as usize;
+                                let length = cqe.res as usize;
+                                let buffer = match &op.resource {
+                                    OpResource::MultishotRecv { buffer, .. } => buffer,
+                                    _ => unreachable!("eddy: receive operation lost its buffers"),
+                                };
+                                let start = buffer_id * buffer_size as usize;
+                                if buffer_id >= (buffer.len() / buffer_size as usize)
+                                    || length > buffer_size as usize
+                                {
+                                    multishot.events.push_back(MultishotEvent::Recv(Err(
+                                        io::Error::new(
+                                            io::ErrorKind::InvalidData,
+                                            "eddy: multishot receive returned an invalid buffer",
+                                        ),
+                                    )));
+                                } else {
+                                    multishot.events.push_back(MultishotEvent::Recv(Ok((
+                                        length,
+                                        buffer[start..start + length].to_vec(),
+                                    ))));
+                                    if more {
+                                        refill = Some((
+                                            cqe.user_data,
+                                            buffer.as_ptr().wrapping_add(start) as u64,
+                                            buffer_size,
+                                            buffer_group,
+                                            buffer_id as u16,
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    multishot.terminal = !more;
+                    if let Some(waker) = op.waker.take() {
+                        wake.push(waker);
+                    }
                 } else {
-                    Ok(cqe.res as usize)
-                });
-                if let Some(waker) = op.waker.take() {
-                    wake.push(waker);
+                    op.result = Some(if cqe.res < 0 {
+                        Err(io::Error::from_raw_os_error(-(cqe.res as i64) as i32))
+                    } else {
+                        Ok(cqe.res as usize)
+                    });
+                    if let Some(waker) = op.waker.take() {
+                        wake.push(waker);
+                    }
                 }
             }
         } else if let Some(&key) = state.orphaned_by_user_data.get(&cqe.user_data) {
-            state.orphaned_by_user_data.remove(&cqe.user_data);
-            let orphan = state.orphaned.remove(key);
-            if matches!(orphan.resource, OpResource::Accept) && cqe.res >= 0 {
-                // An accepted descriptor belongs to the cancelled operation;
-                // do not leak it merely because its future was dropped.
-                // SAFETY: a successful ACCEPT CQE contains a live owned fd.
-                unsafe { libc::close(cqe.res) };
+            let is_multishot = state
+                .orphaned
+                .get(key)
+                .and_then(|op| op.multishot.as_ref())
+                .is_some();
+            if is_multishot {
+                let more = cqe.flags & IORING_CQE_F_MORE != 0;
+                if matches!(
+                    state.orphaned.get(key).map(|op| &op.resource),
+                    Some(OpResource::MultishotAccept)
+                ) && cqe.res >= 0
+                {
+                    // Every accepted descriptor belongs to the dropped stream.
+                    // SAFETY: a successful ACCEPT CQE contains a live fd.
+                    unsafe { libc::close(cqe.res) };
+                }
+                if !more {
+                    let cleanup_complete = state
+                        .orphaned
+                        .get_mut(key)
+                        .and_then(|op| op.multishot.as_mut())
+                        .map(|multishot| {
+                            multishot.terminal = true;
+                            multishot.cleanup_complete
+                        })
+                        .unwrap_or(true);
+                    if cleanup_complete {
+                        state.orphaned_by_user_data.remove(&cqe.user_data);
+                        state.orphaned.remove(key);
+                    }
+                }
+            } else {
+                state.orphaned_by_user_data.remove(&cqe.user_data);
+                let orphan = state.orphaned.remove(key);
+                if matches!(orphan.resource, OpResource::Accept) && cqe.res >= 0 {
+                    // An accepted descriptor belongs to the cancelled operation;
+                    // do not leak it merely because its future was dropped.
+                    // SAFETY: a successful ACCEPT CQE contains a live owned fd.
+                    unsafe { libc::close(cqe.res) };
+                }
             }
+        }
+        if let Some((target, address, length, group, buffer_id)) = refill {
+            refill_queued |= queue_provide_buffer_locked(
+                inner, &mut state, target, address, length, group, buffer_id,
+            )
+            .is_ok();
         }
         current = current.wrapping_add(1);
     }
+    refill_queued |= queue_pending_cleanups_locked(inner, &mut state);
     // SAFETY: publishing consumed CQEs after reading their contents.
     unsafe { store_ring_u32(head, current, Ordering::Release) };
     drop(state);
+    if refill_queued {
+        let _ = submit_inner(inner);
+    }
     for waker in wake {
         waker.wake();
     }
@@ -1754,6 +2344,168 @@ impl Future for WritevOwned {
 }
 
 impl Drop for WritevOwned {
+    fn drop(&mut self) {
+        if let Some(key) = self.key.take() {
+            self.ring.orphan(key);
+        }
+    }
+}
+
+/// Poll-based stream of descriptors produced by a multishot accept operation.
+pub struct AcceptMultishot {
+    ring: IoUring,
+    fd: RawFd,
+    key: Option<usize>,
+    start_error: Option<io::Error>,
+    done: bool,
+}
+
+impl AcceptMultishot {
+    pub fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<Option<OwnedFd>>> {
+        let this = self.get_mut();
+        if this.done {
+            return Poll::Ready(Ok(None));
+        }
+        if let Some(error) = this.start_error.take() {
+            this.done = true;
+            return Poll::Ready(Err(error));
+        }
+        if let Some(key) = this.key {
+            if let Some(event) = this.ring.take_multishot_event(key) {
+                return Poll::Ready(match event {
+                    MultishotEvent::Accept(result) => {
+                        result.map(|fd| {
+                            // SAFETY: a successful multishot ACCEPT CQE transfers
+                            // ownership of this descriptor to the stream.
+                            Some(unsafe { OwnedFd::from_raw_fd(fd) })
+                        })
+                    }
+                    MultishotEvent::Recv(_) => {
+                        unreachable!("eddy: accept stream received a receive event")
+                    }
+                });
+            }
+            if this.ring.multishot_finished(key) {
+                this.ring.remove_multishot(key);
+                this.key = None;
+                this.done = true;
+                return Poll::Ready(Ok(None));
+            }
+            if let Some(op) = this.ring.inner.state.lock().unwrap().ops.get_mut(key) {
+                op.waker = Some(cx.waker().clone());
+            }
+            return Poll::Pending;
+        }
+        match this
+            .ring
+            .start_multishot_accept(this.fd, cx.waker().clone())
+        {
+            Ok(key) => {
+                this.key = Some(key);
+                if let Err(error) = this.ring.submit() {
+                    this.ring.orphan(key);
+                    this.key = None;
+                    this.start_error = Some(error);
+                    return Poll::Ready(Err(this
+                        .start_error
+                        .take()
+                        .expect("eddy: missing multishot submit error")));
+                }
+                Poll::Pending
+            }
+            Err(error) => {
+                this.done = true;
+                Poll::Ready(Err(error))
+            }
+        }
+    }
+}
+
+impl Drop for AcceptMultishot {
+    fn drop(&mut self) {
+        if let Some(key) = self.key.take() {
+            self.ring.orphan(key);
+        }
+    }
+}
+
+/// Poll-based stream of owned byte strings produced by a multishot receive.
+pub type RecvMultishotItem = (usize, Vec<u8>);
+
+pub struct RecvMultishot {
+    ring: IoUring,
+    fd: RawFd,
+    buffer_size: usize,
+    buffer_count: usize,
+    key: Option<usize>,
+    start_error: Option<io::Error>,
+    done: bool,
+}
+
+impl RecvMultishot {
+    pub fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<Option<RecvMultishotItem>>> {
+        let this = self.get_mut();
+        if this.done {
+            return Poll::Ready(Ok(None));
+        }
+        if let Some(error) = this.start_error.take() {
+            this.done = true;
+            return Poll::Ready(Err(error));
+        }
+        if let Some(key) = this.key {
+            if let Some(event) = this.ring.take_multishot_event(key) {
+                return Poll::Ready(match event {
+                    MultishotEvent::Recv(result) => result.map(Some),
+                    MultishotEvent::Accept(_) => {
+                        unreachable!("eddy: receive stream received an accept event")
+                    }
+                });
+            }
+            if this.ring.multishot_finished(key) {
+                this.ring.remove_multishot(key);
+                this.key = None;
+                this.done = true;
+                return Poll::Ready(Ok(None));
+            }
+            if let Some(op) = this.ring.inner.state.lock().unwrap().ops.get_mut(key) {
+                op.waker = Some(cx.waker().clone());
+            }
+            return Poll::Pending;
+        }
+        match this.ring.start_multishot_recv(
+            this.fd,
+            this.buffer_size,
+            this.buffer_count,
+            cx.waker().clone(),
+        ) {
+            Ok(key) => {
+                this.key = Some(key);
+                if let Err(error) = this.ring.submit() {
+                    this.ring.orphan(key);
+                    this.key = None;
+                    this.start_error = Some(error);
+                    return Poll::Ready(Err(this
+                        .start_error
+                        .take()
+                        .expect("eddy: missing multishot submit error")));
+                }
+                Poll::Pending
+            }
+            Err(error) => {
+                this.done = true;
+                Poll::Ready(Err(error))
+            }
+        }
+    }
+}
+
+impl Drop for RecvMultishot {
     fn drop(&mut self) {
         if let Some(key) = self.key.take() {
             self.ring.orphan(key);
@@ -2370,7 +3122,8 @@ impl AsyncWriteOwned for IoUring {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::TcpListener;
+    use std::io::Write;
+    use std::net::{TcpListener, TcpStream};
     use std::os::fd::{AsRawFd, IntoRawFd};
     use std::task::Context;
 
@@ -2385,15 +3138,134 @@ mod tests {
     }
 
     #[test]
-    fn multishot_operations_report_explicit_unsupported() {
-        let Ok(ring) = IoUring::new(2) else {
+    fn multishot_handles_report_invalid_configuration() {
+        let Ok(ring) = IoUring::new(4) else {
             return;
         };
-        let accept_error = ring.accept_multishot(-1).unwrap_err();
-        assert_eq!(accept_error.kind(), io::ErrorKind::Unsupported);
-        let mut buffer = [0_u8; 1];
-        let recv_error = ring.recv_multishot(-1, &mut buffer).unwrap_err();
-        assert_eq!(recv_error.kind(), io::ErrorKind::Unsupported);
+        let mut recv = Box::pin(ring.recv_multishot(-1, 0, 1));
+        let waker = crate::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let error = match recv.as_mut().poll_next(&mut cx) {
+            Poll::Ready(Err(error)) => error,
+            other => panic!("unexpected multishot result: {other:?}"),
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn multishot_accept_delivers_multiple_connections() {
+        let Ok(ring) = IoUring::new(8) else {
+            return;
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut accept = Box::pin(ring.accept_multishot(listener.as_raw_fd()));
+        let waker = crate::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(matches!(accept.as_mut().poll_next(&mut cx), Poll::Pending));
+
+        let client_one = TcpStream::connect(address).unwrap();
+        let client_two = TcpStream::connect(address).unwrap();
+        let mut accepted = Vec::new();
+        for _ in 0..8 {
+            ring.submit_and_wait().unwrap();
+            loop {
+                match accept.as_mut().poll_next(&mut cx) {
+                    Poll::Ready(Ok(Some(fd))) => accepted.push(fd),
+                    Poll::Ready(Err(error))
+                        if matches!(
+                            error.raw_os_error(),
+                            Some(libc::EINVAL | libc::EOPNOTSUPP | libc::ENOSYS)
+                        ) =>
+                    {
+                        return
+                    }
+                    Poll::Ready(other) => panic!("unexpected multishot accept result: {other:?}"),
+                    Poll::Pending => break,
+                }
+            }
+            if accepted.len() == 2 {
+                break;
+            }
+        }
+        assert_eq!(accepted.len(), 2);
+        drop(accepted);
+        drop(client_one);
+        drop(client_two);
+    }
+
+    #[test]
+    fn multishot_recv_returns_owned_packets_and_reuses_buffers() {
+        let Ok(ring) = IoUring::new(8) else {
+            return;
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(address).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let server_fd = server.into_raw_fd();
+        let mut recv = Box::pin(ring.recv_multishot(server_fd, 64, 2));
+        let waker = crate::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let initial = recv.as_mut().poll_next(&mut cx);
+        assert!(matches!(initial, Poll::Pending), "initial={initial:?}");
+
+        client.write_all(b"first").unwrap();
+        let first = loop {
+            ring.submit_and_wait().unwrap();
+            match recv.as_mut().poll_next(&mut cx) {
+                Poll::Ready(Ok(Some((length, buffer)))) => break (length, buffer),
+                Poll::Ready(Err(error))
+                    if matches!(
+                        error.raw_os_error(),
+                        Some(libc::EINVAL | libc::EOPNOTSUPP | libc::ENOSYS)
+                    ) =>
+                {
+                    return
+                }
+                Poll::Ready(other) => panic!("unexpected multishot recv result: {other:?}"),
+                Poll::Pending => {}
+            }
+        };
+        assert_eq!(first, (5, b"first".to_vec()));
+
+        client.write_all(b"second").unwrap();
+        let second = loop {
+            ring.submit_and_wait().unwrap();
+            match recv.as_mut().poll_next(&mut cx) {
+                Poll::Ready(Ok(Some((length, buffer)))) => break (length, buffer),
+                Poll::Ready(Err(error))
+                    if matches!(
+                        error.raw_os_error(),
+                        Some(libc::EINVAL | libc::EOPNOTSUPP | libc::ENOSYS)
+                    ) =>
+                {
+                    return
+                }
+                Poll::Ready(other) => panic!("unexpected multishot recv result: {other:?}"),
+                Poll::Pending => {}
+            }
+        };
+        assert_eq!(second, (6, b"second".to_vec()));
+
+        drop(client);
+        let mut saw_eof = false;
+        let mut ended = false;
+        for _ in 0..8 {
+            ring.submit_and_wait().unwrap();
+            match recv.as_mut().poll_next(&mut cx) {
+                Poll::Ready(Ok(Some((0, _)))) => saw_eof = true,
+                Poll::Ready(Ok(None)) => {
+                    ended = true;
+                    break;
+                }
+                Poll::Ready(Ok(Some(_))) | Poll::Pending => {}
+                Poll::Ready(Err(error)) => panic!("unexpected multishot EOF error: {error}"),
+            }
+        }
+        assert!(saw_eof && ended);
+        drop(recv);
+        let _ = unsafe { libc::close(server_fd) };
     }
 
     #[test]
