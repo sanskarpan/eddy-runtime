@@ -1,0 +1,15 @@
+[book]
+title = "eddy — Async Runtime from Scratch"
+description = "From-scratch async runtime in Rust: tasks, wakers, schedulers, readiness I/O, timer wheel, sync primitives, io_uring, instrumentation, consoles."
+authors = ["Sanskar Pandey"]
+language = "en"
+src = "."
+
+[build]
+create-missing = false
+extra-watch-dirs = ["assets"]
+
+[output.html]
+git-repository-url = "https://github.com/sanskarpan/eddy-runtime"
+edit-url-template = "https://github.com/sanskarpan/eddy-runtime/edit/main/docs/{path}"
+site-url = "/eddy-runtime/"
