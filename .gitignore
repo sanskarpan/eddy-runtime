@@ -2,3 +2,4 @@
 **/*.rs.bk
 /console-ui/node_modules
 /console-ui/dist
+/docs/book

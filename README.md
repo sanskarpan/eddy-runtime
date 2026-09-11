@@ -1,20 +1,49 @@
-# eddy
+# eddy — async runtime from scratch
+
+[![CI](https://github.com/sanskarpan/eddy-runtime/actions/workflows/ci.yml/badge.svg)](https://github.com/sanskarpan/eddy-runtime/actions/workflows/ci.yml)
+[![Docs](https://github.com/sanskarpan/eddy-runtime/actions/workflows/docs.yml/badge.svg)](https://sanskarpan.github.io/eddy-runtime/)
 
 `eddy` is an async runtime built from scratch, with explicit task state,
 custom wakers, current- and multi-thread schedulers, readiness I/O, timers,
-synchronization primitives, and runtime instrumentation.
+synchronization primitives, a Linux `io_uring` backend, and runtime
+instrumentation with TUI and web consoles.
+
+Docs: https://sanskarpan.github.io/eddy-runtime/
+
+## Quickstart
+
+```rust
+fn main() {
+    eddy::Runtime::new().block_on(async {
+        let handle = eddy::spawn(async { 40 + 2 });
+        assert_eq!(handle.await.unwrap(), 42);
+    });
+}
+```
+
+```text
+cargo test -p eddy --all-targets
+cargo clippy -p eddy --all-targets -- -D warnings
+cargo fmt --all -- --check
+RUSTFLAGS='--cfg loom' cargo test -p eddy --lib
+```
+
+## Workspace
+
+```text
+crates/eddy            # the runtime (tasks, schedulers, I/O, timers, sync)
+crates/eddy-macros     # #[eddy::main], #[eddy::test], select!/join!/try_join!
+crates/eddy-console    # ratatui TUI over the instrumentation socket
+crates/eddy-console-web# WebSocket bridge for the browser dashboard
+console-ui/            # Vite + React dashboard (swimlanes, heatmap, wake graph)
+```
 
 ## Verification
 
-```text
-cargo test --workspace --all-targets
-cargo clippy --workspace --all-targets -- -D warnings
-RUSTFLAGS='--cfg loom' cargo test -p eddy --lib
-npm run build --prefix console-ui
-```
-
-Linux-only io_uring, Miri, sanitizer, Windows IOCP, and ARM/QEMU checks run in
-CI. See [`docs/verification.md`](docs/verification.md) for the platform gates.
+Linux-only `io_uring`, Miri, sanitizer, Windows IOCP, and ARM/QEMU checks run
+in CI alongside loom model tests and the Tokio differential suite. See
+[`docs/verification.md`](docs/verification.md) for the platform gates, and
+[`CHECKLIST.md`](CHECKLIST.md) for the 19-phase roadmap (all complete).
 
 ## Benchmark Snapshot
 
@@ -41,3 +70,8 @@ Units: median wall-clock time; lower is better
 The quick run was intentionally bounded and does not replace full Criterion
 runs on each supported target. Instrumentation overhead for the dedicated
 10k spawn/join benchmark measured `+3.1%` median in the same workspace.
+
+## Contributing
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md). One file per commit, `track/*`
+branches, CI must be green before merge.
