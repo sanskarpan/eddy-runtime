@@ -403,7 +403,10 @@
 - [x] 🟡 `SQPOLL` mode behind a flag (kernel polls the SQ, near-zero syscalls)
 - [x] 🟡 Registered fixed buffers to skip per-op pinning
 - [x] 🟡 Registered file descriptors to skip refcounting
-- [ ] 🟡 Multishot accept/recv where the kernel supports it
+- [x] 🟡 Multishot accept/recv where the kernel supports it — `AcceptMultishot`
+  yields owned descriptors; `RecvMultishot` uses owned provided buffers, copies
+  each packet, returns buffers to the kernel, and retains them through final
+  cleanup/cancellation CQEs
 - [x] 🟡 `AsyncReadOwned` / `AsyncWriteOwned` traits
 - [x] 🟡 Test: read a file, verify contents (Linux CI job)
 - [x] 🟡 Test: timeout expiration completes successfully (Linux CI job)
