@@ -40,9 +40,10 @@ pub use poll_evented::PollEvented;
 pub use unix::{UnixDatagram, UnixListener, UnixStream};
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 pub use uring::{
-    AcceptOwned, AsyncReadOwned, AsyncWriteOwned, CloseOwned, ConnectOwned, FixedBufferOwned,
-    FixedFileOwned, IoUring, IoUringBuilder, ReadOwned, ReadvOwned, RecvOwned, RegisteredBuffers,
-    RegisteredFiles, SendOwned, TimeoutOwned, WriteOwned, WritevOwned,
+    AcceptMultishot, AcceptOwned, AsyncReadOwned, AsyncWriteOwned, CloseOwned, ConnectOwned,
+    FixedBufferOwned, FixedFileOwned, IoUring, IoUringBuilder, ReadOwned, ReadvOwned,
+    RecvMultishot, RecvMultishotItem, RecvOwned, RegisteredBuffers, RegisteredFiles, SendOwned,
+    TimeoutOwned, WriteOwned, WritevOwned,
 };
 
 /// A buffer passed to [`AsyncRead::poll_read`]. It tracks bytes that have
