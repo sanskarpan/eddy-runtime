@@ -12,7 +12,7 @@
 
 # Project
 
-- [Roadmap (CHECKLIST)](https://github.com/sanskarpan/eddy-runtime/blob/main/CHECKLIST.md)
-- [Specification (SPEC)](https://github.com/sanskarpan/eddy-runtime/blob/main/SPEC.md)
-- [Contributing](https://github.com/sanskarpan/eddy-runtime/blob/main/CONTRIBUTING.md)
-- [Changelog](https://github.com/sanskarpan/eddy-runtime/blob/main/CHANGELOG.md)
+- [Roadmap](project-roadmap.md)
+- [Specification](project-spec.md)
+- [Contributing](project-contributing.md)
+- [Changelog](project-changelog.md)
