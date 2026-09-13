@@ -38,9 +38,13 @@ RUSTFLAGS='--cfg loom' cargo test -p eddy --lib
 
 ## Consoles
 
+![Console overview](assets/demo.gif)
+![TUI detail](assets/tui.gif)
+
 - `eddy-console` (TUI): task list, worker heatmap, wake causality, poll
   histograms — see `crates/eddy-console`.
 - `eddy-console-web` + `console-ui/`: browser dashboard over a WebSocket
   bridge.
 - Recorded demos live under `docs/assets/`; `docs/assets/demo.sh` drives a
-  synthetic event stream through the TUI for recording.
+  synthetic event stream through the TUI for recording. Rebuild GIFs with:
+  `python3 docs/assets/generate_demo.py && python3 docs/assets/render_gifs.py`.
