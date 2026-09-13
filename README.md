@@ -10,6 +10,9 @@ instrumentation with TUI and web consoles.
 
 Docs: https://sanskarpan.github.io/eddy-runtime/
 
+![Console overview](docs/assets/demo.gif)
+![TUI detail](docs/assets/tui.gif)
+
 ## Quickstart
 
 ```rust
